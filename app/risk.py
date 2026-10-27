@@ -27,8 +27,14 @@ def _in_trusted_network(ip: str) -> bool:
     return ip.startswith(TRUSTED_SUBNET_PREFIXES) or ip == "::1"
 
 
+def outside_work_hours(now: float | None = None) -> bool:
+    """True, если текущий момент вне рабочих часов организации."""
+    hour = time.localtime(now if now is not None else time.time()).tm_hour
+    return not (WORK_HOURS[0] <= hour < WORK_HOURS[1])
+
+
 def score_login(ip: str, ua: str, known_ua: str | None, failed_recent: int,
-                minutes_since_last: float | None) -> tuple[int, list[str]]:
+                minutes_since_last: float | None = None) -> tuple[int, list[str]]:
     """Возвращает (score, причины). Каждая причина — строка для журнала.
 
     Калибровка весов (см. docs/integration.md, раздел «Модель угроз и риск»):
@@ -41,8 +47,11 @@ def score_login(ip: str, ua: str, known_ua: str | None, failed_recent: int,
     score, reasons = 0, []
 
     if failed_recent >= 3:
-        # явный признак перебора: сам по себе достаточен для step-up
-        score += min(40, failed_recent * 8)
+        # Явный признак перебора: вес подобран так, чтобы серия из
+        # MAX_FAILED-1 неудачных попыток САМА (без учёта времени суток)
+        # превышала порог step_up — это достаточное основание для
+        # третьего фактора (OWASP ASVS V2.2.1).
+        score += min(60, failed_recent * 15)
         reasons.append(f"series of failed attempts ({failed_recent})")
 
     if known_ua is None:
@@ -56,8 +65,7 @@ def score_login(ip: str, ua: str, known_ua: str | None, failed_recent: int,
         score += 10
         reasons.append("login from outside trusted network")
 
-    hour = time.localtime().tm_hour
-    if not (WORK_HOURS[0] <= hour < WORK_HOURS[1]):
+    if outside_work_hours():
         score += 8
         reasons.append("login outside business hours")
 

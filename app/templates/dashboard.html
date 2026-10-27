@@ -2,13 +2,11 @@
 {% block title %}Личный кабинет — OrgMFA{% endblock %}
 {% block content %}
   <h1>Здравствуйте, {{ user.full_name or user.login }}</h1>
+  {% if setup %}
+  <div class="sub">Для полного доступа необходимо добавить способ аутентификации.</div>
+  {% else %}
   <div class="sub">Аутентификация выполнена двумя факторами: пароль + TOTP.
      {% if not user.mfa_enabled %}<b>MFA не активирован!</b>{% endif %}</div>
-
-  {% if setup %}
-  <div class="msg" style="background:#fef3c7;border:1px solid #f59e0b;padding:10px;border-radius:8px;margin:12px 0">
-    ⚠ Это временная сессия привязки: полный доступ к системе откроется после подтверждения TOTP-кода.
-  </div>
   {% endif %}
 
   {% if not user.mfa_enabled %}
@@ -66,6 +64,7 @@
   </details>
   {% endif %}
 
+  {% if not setup %}
   <h2 style="font-size:.95rem;margin-top:26px">Журнал событий безопасности</h2>
   <table class="audit">
     <tr><th>Время</th><th>Событие</th><th>IP</th><th>Результат</th></tr>
@@ -78,6 +77,7 @@
     </tr>
     {% endfor %}
   </table>
+  {% endif %}
 
   <form method="get" action="/logout" style="margin-top:20px">
     <button type="submit" style="background:#dc2626">Выйти (завершить сеанс)</button>
