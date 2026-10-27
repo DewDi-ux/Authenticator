@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}Регистрация — OrgMFA{% endblock %}
+{% block content %}
+  <h1>Регистрация сотрудника</h1>
+  <div class="sub">Требования к паролю: ≥10 символов, разные регистры, цифра, без логина</div>
+  {% if msg %}<div class="msg {{ 'err' if ('не' in msg or 'должен' in msg or 'занят' in msg or 'Нужны' in msg or 'Нужна' in msg or 'списк' in msg or 'совпад' in msg) else '' }}"
+       style="{{ 'background:#f0fdf4;color:#16a34a;border:1px solid #bbf7d0' if 'создана' in msg else '' }}">{{ msg }}</div>{% endif %}
+  <form method="post" action="/register" autocomplete="off">
+    <label>Логин</label><input name="login" type="text" required>
+    <label>ФИО</label><input name="full_name" type="text">
+    <label>Пароль</label><input name="password" type="password" required>
+    <label>Пароль ещё раз</label><input name="password2" type="password" required>
+    <button type="submit">Создать учётную запись</button>
+  </form>
+  <div class="links"><a href="/login">Уже есть аккаунт — войти</a></div>
+{% endblock %}

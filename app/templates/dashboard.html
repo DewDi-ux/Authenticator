@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}Личный кабинет — OrgMFA{% endblock %}
+{% block content %}
+  <h1>Здравствуйте, {{ user.full_name or user.login }}</h1>
+  <div class="sub">Аутентификация выполнена двумя факторами: пароль + TOTP.
+     {% if not user.mfa_enabled %}<b>MFA не активирован!</b>{% endif %}</div>
+
+  {% if not user.mfa_enabled %}
+  <div id="enroll">
+    <p style="font-size:.85rem">Привяжите приложение-аутентификатор:</p>
+    <button id="btn-start" type="button">Начать привязку TOTP</button>
+    <div id="qrbox" style="display:none; margin-top:14px">
+      <p style="font-size:.8rem">Секрет (введите вручную в приложении):</p>
+      <code id="secret"></code>
+      <p style="font-size:.8rem; margin-top:10px">Демо-код прямо сейчас (для стенда): <code id="demo-code"></code></p>
+      <form id="confirm-form" autocomplete="off">
+        <label>Код из приложения</label>
+        <input name="code" type="text" inputmode="numeric" placeholder="123456" required>
+        <button type="submit">Подтвердить привязку</button>
+      </form>
+      <div id="err" class="msg err" style="display:none"></div>
+    </div>
+  </div>
+  {% else %}
+  <p style="font-size:.85rem;color:#16a34a">✔ Второй фактор активен. Резервных кодов осталось: {{ user.recovery_hashes|length }}</p>
+  {% endif %}
+
+  <h2 style="font-size:.95rem;margin-top:26px">Журнал событий безопасности</h2>
+  <table class="audit">
+    <tr><th>Время</th><th>Событие</th><th>IP</th><th>Результат</th></tr>
+    {% for e in audit %}
+    <tr>
+      <td>{{ e.ts | round(0) | int | timestamp_fmt }}</td>
+      <td>{{ e.event }}</td>
+      <td>{{ e.ip }}</td>
+      <td>{{ "ok" if e.success else "FAIL" }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+
+  <form method="get" action="/logout" style="margin-top:20px">
+    <button type="submit" style="background:#dc2626">Выйти (завершить сеанс)</button>
+  </form>
+
+<script>
+const btn = document.getElementById("btn-start");
+if (btn) btn.addEventListener("click", async () => {
+  const r = await fetch("/enroll/totp", {method:"POST"});
+  const d = await r.json();
+  if (!d.otpauth_uri) { alert(d.error||"Ошибка"); return; }
+  document.getElementById("secret").textContent = d.secret_b32;
+  document.getElementById("demo-code").textContent = d.demo_current_code;
+  document.getElementById("qrbox").style.display = "block";
+});
+const cf = document.getElementById("confirm-form");
+if (cf) cf.addEventListener("submit", async ev => {
+  ev.preventDefault();
+  const body = new URLSearchParams(new FormData(cf));
+  const r = await fetch("/enroll/totp/confirm", {method:"POST", body});
+  const d = await r.json();
+  if (d.ok) location.reload();
+  else { const e=document.getElementById("err"); e.textContent=d.error; e.style.display="block"; }
+});
+</script>
+{% endblock %}

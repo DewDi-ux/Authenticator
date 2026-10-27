@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>{% block title %}OrgMFA{% endblock %}</title>
+  <style>
+    :root { --accent:#2563eb; --bg:#f1f5f9; --card:#fff; --err:#dc2626; --ok:#16a34a; }
+    * { box-sizing: border-box; }
+    body { font-family: "Segoe UI", Roboto, sans-serif; background: var(--bg); margin:0;
+           display:flex; min-height:100vh; align-items:center; justify-content:center; }
+    .card { background:var(--card); border-radius:14px; box-shadow:0 8px 30px rgba(2,6,23,.08);
+            padding:34px 38px; width:100%; max-width:460px; }
+    h1 { font-size:1.25rem; margin:0 0 4px; color:#0f172a; }
+    .sub { color:#64748b; font-size:.85rem; margin-bottom:20px; }
+    label { display:block; font-size:.82rem; color:#334155; margin:14px 0 4px; }
+    input[type=text], input[type=password] { width:100%; padding:10px 12px; border:1px solid #cbd5e1;
+            border-radius:8px; font-size:1rem; }
+    input:focus { outline:2px solid var(--accent); border-color:transparent; }
+    button { margin-top:20px; width:100%; padding:11px; background:var(--accent); color:#fff;
+             border:0; border-radius:8px; font-size:1rem; cursor:pointer; }
+    button:hover { filter:brightness(1.1); }
+    .msg { padding:10px 12px; border-radius:8px; font-size:.88rem; margin-bottom:14px; }
+    .msg.err { background:#fef2f2; color:var(--err); border:1px solid #fecaca; }
+    .links { margin-top:16px; font-size:.85rem; text-align:center; }
+    .steps { display:flex; gap:8px; margin-bottom:18px; }
+    .step { flex:1; height:5px; border-radius:3px; background:#e2e8f0; }
+    .step.on { background:var(--accent); }
+    code { background:#f8fafc; border:1px solid #e2e8f0; border-radius:6px; padding:2px 6px; word-break:break-all; }
+    table.audit { width:100%; font-size:.78rem; border-collapse:collapse; margin-top:14px; }
+    table.audit td, table.audit th { padding:4px 6px; border-bottom:1px solid #e2e8f0; text-align:left; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    {% block content %}{% endblock %}
+  </div>
+</body>
+</html>

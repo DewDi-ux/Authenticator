@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}Подтверждение — OrgMFA{% endblock %}
+{% block content %}
+  <h1>Ступень 2 — одноразовый код</h1>
+  <div class="sub">Введите 6-значный код из приложения-аутентификатора (Google Authenticator / Яндекс.Ключ)</div>
+  <div class="steps"><div class="step on"></div><div class="step on"></div></div>
+
+  <div id="err" class="msg err" style="display:none"></div>
+
+  <form id="totp-form" autocomplete="off">
+    <label for="code">Код TOTP</label>
+    <input id="code" name="code" type="text" inputmode="numeric" pattern="[0-9 ]{6,7}"
+           maxlength="7" placeholder="123456" required autofocus>
+    <button type="submit">Войти</button>
+  </form>
+
+  <form id="rc-form" autocomplete="off" style="margin-top:22px">
+    <label for="rcode">…или резервный код восстановления</label>
+    <input id="rcode" name="code" type="text" placeholder="XXXXXX-XXXX">
+    <button type="submit">Использовать резервный код</button>
+  </form>
+
+  <div class="links"><a href="/logout">Отменить вход</a></div>
+
+<script>
+async function post(url, form) {
+  const body = new URLSearchParams(new FormData(form));
+  const r = await fetch(url, {method:"POST", body, headers:{"Accept":"application/json"}});
+  return {status: r.status, data: await r.json()};
+}
+function showErr(m){ const e=document.getElementById("err"); e.textContent=m; e.style.display="block"; }
+
+document.getElementById("totp-form").addEventListener("submit", async ev => {
+  ev.preventDefault();
+  const {data} = await post("/verify-totp", ev.target);
+  if (data.ok) location.href = data.redirect; else showErr(data.error);
+});
+document.getElementById("rc-form").addEventListener("submit", async ev => {
+  ev.preventDefault();
+  if (!ev.target.code.value) return;
+  const {data} = await post("/verify-recovery", ev.target);
+  if (data.ok) { alert(data.warning||"Вход выполнен"); location.href = data.redirect; }
+  else showErr(data.error);
+});
+</script>
+{% endblock %}
