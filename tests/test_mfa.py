@@ -128,9 +128,11 @@ class TestAuthFlow:
         assert r.status_code == 200
 
     def _enroll_mfa(self, client):
-        # логин без MFA вернёт 403 с подсказкой про привязку
-        r = client.post("/login", data={"login": "petrov", "password": self.PASSWORD})
-        assert r.status_code == 403
+        # логин без привязанного фактора -> временная сессия "setup" и редирект
+        # в личный кабинет для привязки TOTP
+        r = client.post("/login", data={"login": "petrov", "password": self.PASSWORD},
+                        follow_redirects=False)
+        assert r.status_code == 303 and r.headers["location"] == "/"
         # прямое моделирование привязки фактора (в UI — /enroll/totp + confirm)
         u = store.get_user_by_login("petrov")
         seed = security.generate_totp_secret()
@@ -163,8 +165,11 @@ class TestAuthFlow:
 
     def test_mfa_required_even_with_good_password(self, client):
         self._register(client)   # MFA не привязан
-        r = client.post("/login", data={"login": "petrov", "password": self.PASSWORD})
-        assert r.status_code == 403   # доступ без второго фактора запрещён
+        r = client.post("/login", data={"login": "petrov", "password": self.PASSWORD},
+                        follow_redirects=False)
+        assert r.status_code == 303   # редирект на привязку, полный доступ не выдан
+        who = client.get("/api/whoami")
+        assert who.json()["authenticated"] is False  # setup-сессия != авторизация
 
     def test_replay_of_same_totp_blocked(self, client):
         self._register(client)

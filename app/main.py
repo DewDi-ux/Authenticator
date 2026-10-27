@@ -71,11 +71,13 @@ def _redirect(request: Request, url: str, status: int = 303) -> RedirectResponse
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     s = current_session(request)
-    if s and s["stage"] == "authed":
+    if s and s["stage"] in ("authed", "setup"):
         u = user_of(s)
-        return templates.TemplateResponse(
-            request, "dashboard.html",
-            {"user": u, "audit": store.recent_audit(15)})
+        if u is not None:
+            return templates.TemplateResponse(
+                request, "dashboard.html",
+                {"user": u, "audit": store.recent_audit(15),
+                 "setup": s["stage"] == "setup"})
     return _redirect(request, "/login")
 
 
@@ -173,12 +175,15 @@ async def login(request: Request, login: str = Form(...), password: str = Form(.
                 details={"score": score, "reasons": reasons, "decision": verdict})
 
     if not u.mfa_enabled:
-        # без привязанного фактора доступ запрещён (политика обязательной MFA)
-        store.audit("auth.fail.no_factor", actor=u.login, ip=ip, success=False)
-        return templates.TemplateResponse(
-            request, "login.html",
-            {"msg": "Пароль верный, но второй фактор не привязан. Пройдите привязку TOTP в личном кабинете."},
-            status_code=403)
+        # Политика обязательной MFA: без привязанного фактора полный доступ
+        # запрещён. Пользователю выдаётся временная сессия стадии "setup" —
+        # в личном кабинете он может привязать TOTP (страницы MFA/API при этом
+        # остаются недоступными).
+        store.audit("auth.setup.required", actor=u.login, ip=ip, success=True)
+        tok = store.create_session(u.id, "setup", ip, agent, ttl=10 * 60)
+        resp = _redirect(request, "/")
+        _set_cookie(resp, tok)
+        return resp
 
     # Политика step-up: высокий риск — ужесточаем сессию (короткое время жизни,
     # обязательная ступень 2), но не отклоняем корректную аутентификацию.
