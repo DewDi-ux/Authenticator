@@ -5,6 +5,12 @@
   <div class="sub">Аутентификация выполнена двумя факторами: пароль + TOTP.
      {% if not user.mfa_enabled %}<b>MFA не активирован!</b>{% endif %}</div>
 
+  {% if setup %}
+  <div class="msg" style="background:#fef3c7;border:1px solid #f59e0b;padding:10px;border-radius:8px;margin:12px 0">
+    ⚠ Это временная сессия привязки: полный доступ к системе откроется после подтверждения TOTP-кода.
+  </div>
+  {% endif %}
+
   {% if not user.mfa_enabled %}
   <div id="enroll">
     <p style="font-size:.85rem">Привяжите приложение-аутентификатор:</p>
