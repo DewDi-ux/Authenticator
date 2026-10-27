@@ -85,6 +85,26 @@ class TestSecurityCore:
         assert all(h != c for h, c in zip(hs, codes))
         assert security.hash_recovery_code(codes[0]) in hs
 
+    def test_qr_png_data_uri_is_valid_otpauth_qr(self):
+        """QR для Яндекс.Ключ: PNG декодируется обратно в otpauth:// URI."""
+        import base64 as b64m
+        import io
+        from PIL import Image
+        try:
+            from pyzbar.pyzbar import decode as zbar_decode
+        except ImportError:
+            pytest.skip("pyzbar недоступен в окружении теста")
+        seed = security.generate_totp_secret()
+        uri = security.totp_provisioning_uri(seed, "ivanov")
+        data_uri = security.qr_png_data_uri(uri)
+        assert data_uri.startswith("data:image/png;base64,")
+        png = b64m.b64decode(data_uri.split(",", 1)[1])
+        assert png[:8] == b"\x89PNG\r\n\x1a\n"          # сигнатура PNG
+        # «сканируем камерой» — декодируем QR обратно и сверяем URI
+        img = Image.open(io.BytesIO(png))
+        found = [d.data.decode() for d in zbar_decode(img)]
+        assert uri in found
+
 
 # ---------------------------------------------------------------------------
 class TestRiskEngine:
@@ -170,6 +190,48 @@ class TestAuthFlow:
         assert r.status_code == 303   # редирект на привязку, полный доступ не выдан
         who = client.get("/api/whoami")
         assert who.json()["authenticated"] is False  # setup-сессия != авторизация
+
+    def test_enroll_qr_scan_flow_in_setup_session(self, client):
+        """Сценарий «отсканировать QR вместо ручного ввода секрета»:
+        временная setup-сессия -> /enroll/totp возвращает QR (PNG data-URI),
+        секрет из QR совпадает с сохранённым, /enroll/totp/qr.png отдаёт PNG,
+        подтверждение кодом из «Яндекс Ключа» активирует MFA."""
+        self._register(client)
+        client.post("/login", data={"login": "petrov", "password": self.PASSWORD})
+
+        r = client.post("/enroll/totp")
+        assert r.status_code == 200
+        d = r.json()
+        assert d["otpauth_uri"].startswith("otpauth://totp/")
+        assert d["qr_png"].startswith("data:image/png;base64,")
+
+        # QR декодируется «камерой» Яндекс.Ключа в тот же otpauth:// URI
+        import base64 as b64m, io
+        from PIL import Image
+        png = b64m.b64decode(d["qr_png"].split(",", 1)[1])
+        try:
+            from pyzbar.pyzbar import decode as zbar_decode
+            found = [x.data.decode() for x in zbar_decode(Image.open(io.BytesIO(png)))]
+            assert d["otpauth_uri"] in found
+        except ImportError:
+            pytest.skip("pyzbar недоступен в окружении теста")
+
+        # отдельный GET endpoint отдаёт тот же PNG
+        rq = client.get("/enroll/totp/qr.png")
+        assert rq.status_code == 200 and rq.headers["content-type"] == "image/png"
+        assert rq.content[:8] == b"\x89PNG\r\n\x1a\n"
+
+        # без активной сессии QR с секретом недоступен
+        client.post("/logout")
+        assert client.get("/enroll/totp/qr.png").status_code == 400
+
+        # пользователь «просканировал QR» — код из того же seed'а завершает привязку
+        client.post("/login", data={"login": "petrov", "password": self.PASSWORD})
+        u = store.get_user_by_login("petrov")
+        seed = security.decrypt_secret(u.totp_enc)
+        r = client.post("/enroll/totp/confirm", data={"code": security.totp_now(seed)})
+        assert r.json().get("ok")
+        assert store.get_user_by_login("petrov").mfa_enabled
 
     def test_replay_of_same_totp_blocked(self, client):
         self._register(client)

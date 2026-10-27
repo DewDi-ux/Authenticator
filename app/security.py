@@ -14,10 +14,12 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import io
 import os
 import secrets
 
 import pyotp
+import qrcode
 from argon2 import PasswordHasher, Type as Argon2Type
 from argon2.exceptions import InvalidHashError, VerifyMismatchError
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -91,6 +93,24 @@ def totp_provisioning_uri(secret_plain: bytes, account_name: str, issuer: str = 
     """otpauth:// URI для QR-кода в Google Authenticator / Яндекс.Ключ."""
     secret_b32 = base64.b32encode(secret_plain).decode().rstrip("=")
     return pyotp.TOTP(secret_b32).provisioning_uri(name=account_name, issuer_name=issuer)
+
+
+def qr_png_data_uri(otpauth_uri: str) -> str:
+    """PNG QR-код (data: URI) из otpauth:// строки.
+
+    Приложение «Яндекс Ключ» (и любой другой совместимый с RFC 6238
+    аутентификатор) распознаёт otpauth:// URI при сканировании камеры —
+    пользователю не нужно вводить длинный Base32-секрет вручную.
+    Кодирование — byte mode (без потери данных), уровень коррекции M,
+    box_size=6 px: достаточно крупно для надёжного сканирования с экрана.
+    """
+    img = qrcode.QRCode(border=2, box_size=6, error_correction=qrcode.constants.ERROR_CORRECT_M)
+    img.add_data(otpauth_uri.encode("utf-8"))   # byte mode — точно кодирует URI
+    img.make(fit=True)
+    buf = io.BytesIO()
+    img.make_image(fill_color="black", back_color="white").save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    return f"data:image/png;base64,{b64}"
 
 
 def totp_now(secret_plain: bytes) -> str:

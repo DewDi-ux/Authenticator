@@ -14,9 +14,10 @@ main.py — сервис многоступенчатой аутентифика
 
 from __future__ import annotations
 
+import base64
 import time
 
-from fastapi import FastAPI, Form, Request
+from fastapi import FastAPI, Form, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pathlib import Path
@@ -312,12 +313,30 @@ async def enroll_totp_start(request: Request):
     totp_preview = security.totp_now(seed)  # для демо/отладки (в проде убрать!)
     store.audit("enroll.totp.started", actor=u.login, ip=client_ip(request))
     return JSONResponse({"otpauth_uri": uri, "secret_b32": _b32(seed),
+                         "qr_png": security.qr_png_data_uri(uri),
                          "demo_current_code": totp_preview})
 
 
 def _b32(b: bytes) -> str:
     import base64
     return base64.b32encode(b).decode().rstrip("=")
+
+
+@app.get("/enroll/totp/qr.png")
+async def enroll_totp_qr(request: Request):
+    """PNG QR-кода с otpauth:// URI текущей привязки.
+
+    Альтернатива inline data-URI: картинку можно показать на отдельной
+    странице/принтер; сканируется «Яндекс Ключом» без ручного ввода секрета.
+    Секрет отдаётся только владельцу активной сессии привязки.
+    """
+    s = current_session(request)
+    u = user_of(s) if s else None
+    if u is None or u.totp_enc is None:
+        return JSONResponse({"error": "Нет незавершённой привязки."}, 400)
+    uri = security.totp_provisioning_uri(security.decrypt_secret(u.totp_enc), u.login)
+    png = security.qr_png_data_uri(uri).split(",", 1)[1]  # снять префикс data:...;base64,
+    return Response(content=base64.b64decode(png), media_type="image/png")
 
 
 @app.post("/enroll/totp/confirm")

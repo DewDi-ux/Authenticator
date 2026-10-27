@@ -16,11 +16,21 @@
     <p style="font-size:.85rem">Привяжите приложение-аутентификатор:</p>
     <button id="btn-start" type="button">Начать привязку TOTP</button>
     <div id="qrbox" style="display:none; margin-top:14px">
-      <p style="font-size:.8rem">Секрет (введите вручную в приложении):</p>
-      <code id="secret"></code>
+      <p style="font-size:.8rem"><b>Шаг 1.</b> Откройте «Яндекс Ключ» → «Добавить
+        вручную» → сканируйте этот QR-код камерой. Секрет подставится автоматически,
+        вводить длинный код не нужно.</p>
+      <img id="qr" alt="QR-код для Яндекс.Ключ / Google Authenticator"
+           style="display:block;width:230px;height:230px;image-rendering:pixelated;border:1px solid #e2e8f0;border-radius:10px;padding:6px;background:#fff;margin:8px 0">
+      <details style="margin:6px 0">
+        <summary style="font-size:.8rem;cursor:pointer;color:#475569">
+          Не получается отсканировать? Введите секрет вручную</summary>
+        <p style="font-size:.8rem">Секретный ключ (Base32):</p>
+        <code id="secret"></code>
+        <p style="font-size:.75rem;color:#64748b">otpauth:// URI: <span id="uri" style="word-break:break-all"></span></p>
+      </details>
       <p style="font-size:.8rem; margin-top:10px">Демо-код прямо сейчас (для стенда): <code id="demo-code"></code></p>
       <form id="confirm-form" autocomplete="off">
-        <label>Код из приложения</label>
+        <label>Шаг 2. Код из приложения</label>
         <input name="code" type="text" inputmode="numeric" placeholder="123456" required>
         <button type="submit">Подтвердить привязку</button>
       </form>
@@ -54,7 +64,11 @@ if (btn) btn.addEventListener("click", async () => {
   const r = await fetch("/enroll/totp", {method:"POST"});
   const d = await r.json();
   if (!d.otpauth_uri) { alert(d.error||"Ошибка"); return; }
+  // QR-код с otpauth:// URI: Яндекс.Ключ распознаёт его камерой и
+  // сам добавляет аккаунт — ручной ввод секрета не требуется.
+  document.getElementById("qr").src = d.qr_png || "/enroll/totp/qr.png";
   document.getElementById("secret").textContent = d.secret_b32;
+  document.getElementById("uri").textContent = d.otpauth_uri;
   document.getElementById("demo-code").textContent = d.demo_current_code;
   document.getElementById("qrbox").style.display = "block";
 });
