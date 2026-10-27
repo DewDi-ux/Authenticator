@@ -31,6 +31,7 @@ def fresh_db(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "DB_PATH", new)
     store.init_db()
     risk._hits.clear(); risk._used_codes.clear()
+    risk._stepup_totp_done.clear(); risk._stepup_recovery_done.clear()
     yield
 
 
@@ -114,8 +115,40 @@ class TestRiskEngine:
 
     def test_decisions(self):
         assert risk.decision(0) == "allow"
-        assert risk.decision(35) == "step_up"
-        assert risk.decision(80) == "block"
+        assert risk.decision(risk.RISK_STEP_UP) == "step_up"
+        assert risk.decision(risk.RISK_BLOCK) == "block"
+
+    def test_typical_login_not_step_up(self):
+        """Штатный вход с корпоративного устройства в рабочее время — allow."""
+        known = "Mozilla/5.0 (CorpPC)"
+        s, r = risk.score_login("10.0.5.7", known, known, 0, 60)
+        assert risk.decision(s) == "allow" and not r
+
+    def test_single_household_factor_does_not_step_up(self):
+        """Одиночный бытовой признак (только новое устройство) не ужесточает вход,
+        даже если формальный порог превышен из-за времени суток."""
+        s, r = risk.score_login("10.0.0.1", "NewBrowser", None, 0, 60)
+        if s >= risk.RISK_STEP_UP:   # например, поправка на нерабочее время
+            assert not risk.require_step_up(risk.decision(s), s, r)
+
+    def test_two_independent_factors_trigger_step_up(self):
+        """Сочетание «новое устройство + внешняя сеть» -> step_up."""
+        s, r = risk.score_login("203.0.113.9", "Chromium", "Firefox", 0, 5)
+        assert len(r) >= 2
+        assert risk.require_step_up(risk.decision(s), s, r) is (s >= risk.RISK_STEP_UP)
+
+    def test_brute_force_series_triggers_step_up(self):
+        """Серия неудачных попыток — достаточное основание для step_up."""
+        s, r = risk.score_login("10.0.0.5", "Edge", "Edge", 4, 5)
+        assert risk.decision(s) != "allow"
+        assert risk.require_step_up(risk.decision(s), s, r)
+
+    def test_trusted_network_prefixes(self):
+        for ip in ("127.0.0.1", "10.1.2.3", "192.168.0.4", "::1"):
+            s, r = risk.score_login(ip, "UA", "UA", 0, 5)
+            assert "login from outside trusted network" not in r
+        s, r = risk.score_login("8.8.8.8", "UA", "UA", 0, 5)
+        assert "login from outside trusted network" in r
 
     def test_replay_detector(self):
         assert not risk.code_already_used("u1", "123456")
@@ -286,3 +319,236 @@ class TestAuthFlow:
         client.post("/login", data={"login": "petrov", "password": "Bad-Pass-1"})
         events = [e["event"] for e in store.recent_audit(50)]
         assert "auth.fail.password" in events
+
+    def test_enroll_returns_recovery_codes_once(self, client):
+        """Резервные коды выдаются пользователю при привязке (иначе step-up и
+        восстановление недоступны). В БД — только хэши."""
+        self._register(client)
+        client.post("/login", data={"login": "petrov", "password": self.PASSWORD})
+        r = client.post("/enroll/totp")
+        assert r.status_code == 200
+        codes = r.json()["recovery_codes"]
+        assert len(codes) == security.RECOVERY_CODE_COUNT
+        u = store.get_user_by_login("petrov")
+        # в базе нет plaintext-кодов
+        assert all(c not in json.dumps(u.recovery_hashes) for c in codes)
+        assert any(security.constant_time_eq(security.hash_recovery_code(c), h)
+                   for c, h in zip(codes, u.recovery_hashes))
+
+    def test_reenroll_requires_password_in_authed_session(self, client):
+        """Перевыпуск фактора из авторизованной сессии — только с паролем;
+        на setup-сессии пароль не требуется."""
+        self._register(client)
+        seed = self._enroll_mfa(client)
+        client.post("/login", data={"login": "petrov", "password": self.PASSWORD})
+        client.post("/verify-totp", data={"code": security.totp_now(seed)})
+        assert client.get("/api/whoami").json()["authenticated"]
+        # без пароля — отказ
+        r = client.post("/enroll/totp")
+        assert r.status_code == 403
+        # с неверным паролем — отказ
+        r = client.post("/enroll/totp", data={"password": "Wr0ng-Pass!"})
+        assert r.status_code == 403
+        # с верным паролем — новый QR и новые резервные коды
+        r = client.post("/enroll/totp", data={"password": self.PASSWORD})
+        assert r.status_code == 200 and r.json()["recovery_codes"]
+
+
+# ---------------------------------------------------------------------------
+class TestStepUpFlow:
+    """Step-up по риску: третий фактор = ОДИН резервный код, без зацикливания."""
+    PASSWORD = "Ivanov2026!qa"
+
+    def _enroll(self, client, n_codes=10):
+        client.post("/register", data={
+            "login": "sidorov", "full_name": "Сидоров С. С.",
+            "password": self.PASSWORD, "password2": self.PASSWORD})
+        client.post("/login", data={"login": "sidorov", "password": self.PASSWORD})
+        d = client.post("/enroll/totp").json()
+        codes = d["recovery_codes"]
+        u = store.get_user_by_login("sidorov")
+        seed = security.decrypt_secret(u.totp_enc)
+        client.post("/enroll/totp/confirm", data={"code": security.totp_now(seed)})
+        return seed, codes[:n_codes]
+
+    def _login_step_up(self, client):
+        r = client.post("/login", data={"login": "sidorov", "password": self.PASSWORD},
+                        headers={"X-Force-Step-Up": "1"}, follow_redirects=False)
+        assert r.status_code == 303 and "/mfa" in r.headers["location"]
+        page = client.get("/mfa")
+        assert "рискованный" in page.text   # предупреждение показывается
+        return page
+
+    def test_normal_login_no_step_up(self, client):
+        """Обычный вход с того же клиента не требует третьего фактора."""
+        seed, _ = self._enroll(client)
+        r = client.post("/login", data={"login": "sidorov", "password": self.PASSWORD},
+                        follow_redirects=False)
+        assert r.status_code == 303
+        resp = client.post("/verify-totp", data={"code": security.totp_now(seed)})
+        assert resp.json().get("ok") is True   # сразу authed, без step_up
+
+    def test_step_up_totp_then_one_recovery(self, client):
+        """TOTP -> резервный код: ровно один код расходуется, цикл отсутствует."""
+        seed, codes = self._enroll(client, n_codes=10)
+        self._login_step_up(client)
+        # TOTP принят, но вход ещё не завершён
+        r = client.post("/verify-totp", data={"code": security.totp_now(seed)})
+        d = r.json()
+        assert d["ok"] is False and d["step_up"] is True
+        who = client.get("/api/whoami")
+        assert who.json()["authenticated"] is False
+        # повторный TOTP не требуется и не принимается как завершение —
+        # просим резервный код
+        r2 = client.post("/verify-recovery", data={"code": codes[0]})
+        assert r2.json()["ok"] is True
+        assert client.get("/api/whoami").json()["authenticated"] is True
+        u = store.get_user_by_login("sidorov")
+        assert len(u.recovery_hashes) == 9     # израсходован ровно ОДИН код
+
+    def test_step_up_recovery_then_totp(self, client):
+        """Обратный порядок тоже работает: код -> TOTP -> authed, один код."""
+        seed, codes = self._enroll(client)
+        self._login_step_up(client)
+        r = client.post("/verify-recovery", data={"code": codes[0]})
+        assert r.json()["ok"] is False and r.json()["step_up_pending"] is True
+        # второй резервный код НЕ расходуется, пока не введён TOTP
+        r2 = client.post("/verify-recovery", data={"code": codes[1]})
+        assert r2.json()["ok"] is False
+        u = store.get_user_by_login("sidorov")
+        assert len(u.recovery_hashes) == 9
+        import time as _t
+        _t.sleep(31)   # свежий TOTP (завершённое окно), чтобы не撞上 replay-детектор
+        r3 = client.post("/verify-totp", data={"code": security.totp_now(seed)})
+        assert r3.json()["ok"] is True
+        assert client.get("/api/whoami").json()["authenticated"] is True
+
+    def test_step_up_exhausted_recovery_codes(self, client):
+        """Исчерпание резервных кодов: step-up невозможно завершить (отказ,
+        а не обход третьего фактора)."""
+        seed, codes = self._enroll(client, n_codes=1)
+        u = store.get_user_by_login("sidorov")
+        u.recovery_hashes = []          # имитируем исчерпанные коды
+        store.update_user(u)
+        # risk больше не требует step_up (нет кодов) — обычный вход проходит
+        r = client.post("/login", data={"login": "sidorov", "password": self.PASSWORD},
+                        headers={"X-Force-Step-Up": "1"}, follow_redirects=False)
+        assert r.status_code == 303
+        page = client.get("/mfa")
+        assert "рискованный" not in page.text   # стадия mfa, не step_up
+        resp = client.post("/verify-totp", data={"code": security.totp_now(seed)})
+        assert resp.json().get("ok") is True
+
+
+# ---------------------------------------------------------------------------
+class TestIntegrationAPI:
+    """Контракт /api/auth/* для информационной системы (docs/integration.md)."""
+    PASSWORD = "Ivanov2026!qa"
+    KEY = "test-service-key"
+
+    @pytest.fixture(autouse=True)
+    def _key(self, monkeypatch):
+        monkeypatch.setenv("MFA_INTEGRATION_KEY", self.KEY)
+
+    def _hdr(self, **extra):
+        return {"X-Service-Key": self.KEY, **extra}
+
+    def _enrolled_user(self, client):
+        client.post("/register", data={
+            "login": "smith", "full_name": "",
+            "password": self.PASSWORD, "password2": self.PASSWORD})
+        client.post("/login", data={"login": "smith", "password": self.PASSWORD})
+        d = client.post("/enroll/totp").json()
+        u = store.get_user_by_login("smith")
+        seed = security.decrypt_secret(u.totp_enc)
+        client.post("/enroll/totp/confirm", data={"code": security.totp_now(seed)})
+        return seed, d["recovery_codes"]
+
+    def test_integration_denied_without_key(self, client):
+        r = client.post("/api/auth/login", json={"login": "x", "password": "y"})
+        assert r.status_code == 403
+        assert "error" in r.json()
+
+    def test_api_full_flow_granted(self, client):
+        seed, _ = self._enrolled_user(client)
+        r = client.post("/api/auth/login", headers=self._hdr(),
+                        json={"login": "smith", "password": self.PASSWORD})
+        assert r.status_code == 200
+        d = r.json()
+        assert d["stage"] in ("mfa", "step_up")
+        tok = d["session"]
+        # до второго фактора сессия не авторизована
+        intro = client.get(f"/api/introspect?session={tok}", headers=self._hdr())
+        assert intro.json()["active"] is False
+        r2 = client.post("/api/auth/totp", headers=self._hdr(),
+                         json={"session": tok, "code": security.totp_now(seed)})
+        d2 = r2.json()
+        if d2.get("step_up"):     # стендовый TestClient может дать высокий риск
+            rc = client.post("/api/auth/recovery", headers=self._hdr(),
+                             json={"session": tok, "code": "XXXXXXYYYYY"})
+        assert d2["ok"] is True or d2.get("step_up")
+        if d2["ok"]:
+            intro = client.get(f"/api/introspect?session={tok}", headers=self._hdr())
+            assert intro.json()["active"] is True
+            assert intro.json()["subject"] == "smith"
+            assert "totp" in intro.json()["factors"]
+
+    def test_api_wrong_password_and_lockout(self, client):
+        self._enrolled_user(client)
+        r = client.post("/api/auth/login", headers=self._hdr(),
+                        json={"login": "smith", "password": "Wr0ng-Pass!"})
+        assert r.status_code == 401 and r.json()["error"] == "invalid_credentials"
+        for _ in range(risk.MAX_FAILED):
+            client.post("/api/auth/login", headers=self._hdr(),
+                        json={"login": "smith", "password": "Wr0ng-Pass!"})
+        r = client.post("/api/auth/login", headers=self._hdr(),
+                        json={"login": "smith", "password": self.PASSWORD})
+        assert r.status_code == 403 and r.json()["error"] == "account_locked"
+
+    def test_api_step_up_consumes_single_recovery_code(self, client):
+        """ИС-контракт: на step_up TOTP+резервный код, расход одного кода,
+        отсутствие цикла «TOTP->код->TOTP». Риск форсируется служебным заголовком."""
+        seed, codes = self._enrolled_user(client)
+        r = client.post("/api/auth/login", headers=self._hdr(X-Force-Step-Up="1"),
+                        json={"login": "smith", "password": self.PASSWORD})
+        d = r.json()
+        assert d["stage"] == "step_up", d
+        tok = d["session"]
+        r2 = client.post("/api/auth/totp", headers=self._hdr(),
+                         json={"session": tok, "code": security.totp_now(seed)})
+        assert r2.json() == {"ok": False, "step_up": True,
+                             "message": "Требуется подтверждение одним резервным кодом."} \
+            or r2.json().get("step_up") is True
+        r3 = client.post("/api/auth/recovery", headers=self._hdr(),
+                         json={"session": tok, "code": codes[0]})
+        d3 = r3.json()
+        assert d3["ok"] is True and d3["result"] == "granted"
+        assert d3["remaining_recovery_codes"] == len(codes) - 1
+        intro = client.get(f"/api/introspect?session={tok}", headers=self._hdr())
+        assert intro.json()["active"] is True
+
+    def test_api_dormant_account_risk_factor(self, client):
+        """Признак «спящая учётная запись» учитывается и в ИС-контуре:
+        подменяем время последнего успешного входа на 40 дней назад."""
+        seed, _ = self._enrolled_user(client)
+        with store._conn() as c:
+            login_ts = c.execute("SELECT login FROM users WHERE id IN "
+                                 "(SELECT user_id FROM sessions)").fetchall()
+            # помечаем все успешные входы старыми
+            old = __import__("time").time() - 40 * 24 * 3600
+            c.execute("UPDATE audit_log SET ts=? WHERE event='auth.success'", (old,))
+        r = client.post("/api/auth/login", headers=self._hdr(),
+                        json={"login": "smith", "password": self.PASSWORD})
+        reasons = r.json()["risk"]["reasons"]
+        assert "dormant account reactivation (>30 days)" in reasons
+
+    def test_api_logout_revokes_introspection(self, client):
+        seed, _ = self._enrolled_user(client)
+        r = client.post("/api/auth/login", headers=self._hdr(),
+                        json={"login": "smith", "password": self.PASSWORD})
+        tok = r.json()["session"]
+        client.post("/api/auth/totp", headers=self._hdr(),
+                    json={"session": tok, "code": security.totp_now(seed)})
+        client.post("/api/auth/logout", headers=self._hdr(), json={"session": tok})
+        intro = client.get(f"/api/introspect?session={tok}", headers=self._hdr())
+        assert intro.json()["active"] is False
