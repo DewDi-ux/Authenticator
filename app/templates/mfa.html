@@ -5,7 +5,16 @@
   <div class="sub">Введите 6-значный код из приложения-аутентификатора (Google Authenticator / Яндекс.Ключ)</div>
   <div class="steps"><div class="step on"></div><div class="step on"></div></div>
 
+  {% if step_up %}
+  <div class="msg" style="background:#fef3c7;border:1px solid #f59e0b;padding:10px;border-radius:8px;margin:12px 0">
+    ⚠ Система оценила этот вход как рискованный (смена устройства/сети, серия
+    неудачных попыток или нетипичное время). Для завершения входа после TOTP
+    потребуется подтверждение резервным кодом — третий фактор.
+  </div>
+  {% endif %}
+
   <div id="err" class="msg err" style="display:none"></div>
+  <div id="info" class="msg" style="display:none;background:#e0f2fe;border:1px solid #0ea5e9;padding:10px;border-radius:8px"></div>
 
   <form id="totp-form" autocomplete="off">
     <label for="code">Код TOTP</label>
@@ -28,18 +37,24 @@ async function post(url, form) {
   const r = await fetch(url, {method:"POST", body, headers:{"Accept":"application/json"}});
   return {status: r.status, data: await r.json()};
 }
-function showErr(m){ const e=document.getElementById("err"); e.textContent=m; e.style.display="block"; }
+function showErr(m){ const e=document.getElementById("err"); e.textContent=m; e.style.display="block";
+                     document.getElementById("info").style.display="none"; }
+function showInfo(m){ const i=document.getElementById("info"); i.textContent=m; i.style.display="block";
+                      document.getElementById("err").style.display="none"; }
 
 document.getElementById("totp-form").addEventListener("submit", async ev => {
   ev.preventDefault();
   const {data} = await post("/verify-totp", ev.target);
-  if (data.ok) location.href = data.redirect; else showErr(data.error);
+  if (data.ok) { location.href = data.redirect; }
+  else if (data.step_up) { showInfo(data.message); }          // ждём резервный код
+  else showErr(data.error);
 });
 document.getElementById("rc-form").addEventListener("submit", async ev => {
   ev.preventDefault();
   if (!ev.target.code.value) return;
   const {data} = await post("/verify-recovery", ev.target);
   if (data.ok) { alert(data.warning||"Вход выполнен"); location.href = data.redirect; }
+  else if (data.step_up_pending) { showInfo(data.message); }  // резервный принят, ждём TOTP
   else showErr(data.error);
 });
 </script>

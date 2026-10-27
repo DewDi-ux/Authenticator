@@ -109,3 +109,34 @@ def apply_failed_attempt(u, ip: str) -> None:
 
 def is_locked(u, now: float | None = None) -> bool:
     return (now or time.time()) < u.locked_until
+
+
+# ---------------------------------------------------------------------------
+# Step-up при высоком риске: после верного пароля и TOTP требуется
+# подтверждение резервным кодом. Одноразовый флаг ставится на сессию,
+# чтобы не требовать второй резервный код в том же сеансе входа.
+# ---------------------------------------------------------------------------
+_stepup_ok: set[str] = set()
+
+
+def require_step_up(verdict: str, score: int) -> bool:
+    """Политика: step_up и block означают «дополнительная проверка нужна».
+
+    'block' в контексте уже корректно пройденной ступени 1 трактуется как
+    максимальный step-up (см. README / docs/integration.md): вход не
+    отклоняется молча, но без подтверждения третьим фактором не выполняется.
+    """
+    return verdict in ("step_up", "block")
+
+
+def step_up_done(token: str) -> bool:
+    return token in _stepup_ok
+
+
+def mark_step_up_done(token: str) -> None:
+    _stepup_ok.discard(token)      # одноразово: повторное прохождение не нужно
+    _stepup_ok.add(token)
+
+
+def clear_step_up(token: str) -> None:
+    _stepup_ok.discard(token)
