@@ -20,6 +20,8 @@ from . import security
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "mfa.db"
 _lock = threading.Lock()
 
+AUTHED_TTL = 8 * 3600.0   # время жизни авторизованной сессии (совпадает с cookie)
+
 
 def _conn() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -47,10 +49,11 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS sessions(
                 token TEXT PRIMARY KEY,
                 user_id TEXT NOT NULL,
-                stage TEXT NOT NULL,           -- password | mfa | authed
+                stage TEXT NOT NULL,           -- password | mfa | step_up | setup | authed
                 ip TEXT, user_agent TEXT,
                 last_ua TEXT,                  -- «доверительный» UA прошлых входов
-                created_at REAL, expires_at REAL
+                created_at REAL, expires_at REAL,
+                risk_score INTEGER DEFAULT 0   -- оценка риска при создании сессии
             );
             CREATE TABLE IF NOT EXISTS audit_log(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -59,6 +62,11 @@ def init_db() -> None:
             );
             """
         )
+        # мягкая миграция стендов с ранней схемой: добавить недостающие столбцы
+        cols = {r["name"] for r in c.execute("PRAGMA table_info(sessions)")}
+        for col, decl in (("last_ua", "TEXT"), ("risk_score", "INTEGER DEFAULT 0")):
+            if col not in cols:
+                c.execute(f"ALTER TABLE sessions ADD COLUMN {col} {decl}")
 
 
 # ---------------------------------------------------------------------------
@@ -124,14 +132,15 @@ def update_user(u: User) -> None:
 # Сессии multi-stage state machine: password -> mfa -> authed
 # ---------------------------------------------------------------------------
 def create_session(user_id: str, stage: str, ip: str = "", ua: str = "",
-                   ttl: float = 120.0, last_ua: str | None = None) -> str:
+                   ttl: float = 120.0, last_ua: str | None = None,
+                   risk_score: int = 0) -> str:
     token = uuid.uuid4().hex + uuid.uuid4().hex  # 256 бит энтропии
     now = time.time()
     with _lock, _conn() as c:
         c.execute("DELETE FROM sessions WHERE expires_at < ?", (now,))
         c.execute(
-            "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?)",
-            (token, user_id, stage, ip, ua, last_ua, now, now + ttl),
+            "INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?)",
+            (token, user_id, stage, ip, ua, last_ua, now, now + ttl, risk_score),
         )
     return token
 
@@ -144,7 +153,9 @@ def get_session(token: str) -> dict | None:
     return dict(r)
 
 
-def set_session_stage(token: str, stage: str, ttl: float = 8 * 3600) -> None:
+def set_session_stage(token: str, stage: str, ttl: float | None = None) -> None:
+    if ttl is None:
+        ttl = AUTHED_TTL if stage == "authed" else 15 * 60
     with _lock, _conn() as c:
         c.execute("UPDATE sessions SET stage=?, expires_at=? WHERE token=?",
                   (stage, time.time() + ttl, token))

@@ -4,10 +4,15 @@ main.py — сервис многоступенчатой аутентифика
 Стек: Python 3.12, FastAPI. Сессии — HttpOnly cookie + SameSite=Lax.
 
 Поток аутентификации (state machine):
-    [1] POST /login        пароль  -> stage=password->mfa (или block при high risk)
-    [2] POST /verify-totp  TOTP    -> stage=mfa->authed
+    [1] POST /login        пароль + оценка риска -> stage "mfa"
+                           (при риск-вердикте step_up/block -> stage "step_up":
+                            после TOTP требуется дополнительный резервный код)
+    [2] POST /verify-totp  TOTP    -> stage=mfa->authed (step_up->подтверждение)
     [*] POST /verify-recovery резервный код вместо TOTP (потеря телефона)
 Привязка фактора: /enroll/totp (QR otpauth://) -> /enroll/totp/confirm.
+Интеграция с ИС (сервисный контракт X-Service-Key): /api/auth/login,
+/api/auth/totp, /api/auth/recovery, /api/introspect, /api/auth/logout —
+см. docs/integration.md.
 
 Запуск:  uvicorn app.main:app --reload
 """
@@ -15,6 +20,7 @@ main.py — сервис многоступенчатой аутентифика
 from __future__ import annotations
 
 import base64
+import os
 import time
 
 from fastapi import FastAPI, Form, Request, Response
@@ -90,9 +96,10 @@ async def login_page(request: Request):
 @app.get("/mfa", response_class=HTMLResponse)
 async def mfa_page(request: Request):
     s = current_session(request)
-    if not s or s["stage"] != "mfa":
+    if not s or s["stage"] not in ("mfa", "step_up"):
         return _redirect(request, "/login")
-    return templates.TemplateResponse(request, "mfa.html")
+    return templates.TemplateResponse(
+        request, "mfa.html", {"step_up": s["stage"] == "step_up"})
 
 
 @app.get("/register", response_class=HTMLResponse)
@@ -160,20 +167,36 @@ async def login(request: Request, login: str = Form(...), password: str = Form(.
                     details={"failed_total": u.failed_attempts})
         return _login_error(request)
 
+    # --- оценка риска ДО сброса счётчика неудачных попыток ---
+    # Иначе серия из MAX_FAILED-1 неверных паролей «обнулялась» верным
+    # паролем до вычисления score, и фактор перебора никогда не влиял на
+    # решение. Теперь риск считается по накопленному счётчику.
+    last_login_ts = _last_success_ts(u.id)
+    minutes_since = (time.time() - last_login_ts) / 60 if last_login_ts else None
+    score, reasons = risk.score_login(ip, agent, _known_ua(u.id),
+                                      u.failed_attempts, minutes_since)
+    verdict = risk.decision(score)
+    store.audit("auth.risk_score", actor=u.login, ip=ip,
+                details={"score": score, "reasons": reasons, "decision": verdict,
+                         "failed_recent": u.failed_attempts})
+
+    # --- высокий риск реально влияет на аутентификацию: verdict != allow
+    # ужесточает сеанс (стадия step_up — вход возможен только после
+    # подтверждения резервным кодом, см. /verify-totp и /verify-recovery).
+    # Требование третьего фактора применимо только если он существует
+    # (коды выданы при подтверждённой привязке TOTP).
+    need_step_up = (risk.require_step_up(verdict, score) and u.mfa_enabled
+                    and bool(u.recovery_hashes))
+
     # --- успешная 1-я ступень: сброс счётчика, rehash-upgrade ---
     u.failed_attempts = 0
     if needs_rehash:
         u.pass_hash = security.hash_password(password)
     store.update_user(u)
 
-    # --- risk-based decision (step-up, не блокировка при верном пароле) ---
-    last_login_ts = _last_success_ts(u.id)
-    minutes_since = (time.time() - last_login_ts) / 60 if last_login_ts else None
-    known_ua = _known_ua(u.id)
-    score, reasons = risk.score_login(ip, agent, known_ua, u.failed_attempts, minutes_since)
-    verdict = risk.decision(score)
-    store.audit("auth.risk_score", actor=u.login, ip=ip,
-                details={"score": score, "reasons": reasons, "decision": verdict})
+    # Учётный признак «перебор» уже отражён в score/verdict — не двойним его
+    # константным штрафом за new device при первом же авторизованном входе.
+    known_ua = _known_ua(u.id) or agent
 
     if not u.mfa_enabled:
         # Политика обязательной MFA: без привязанного фактора полный доступ
@@ -186,10 +209,13 @@ async def login(request: Request, login: str = Form(...), password: str = Form(.
         _set_cookie(resp, tok)
         return resp
 
-    # Политика step-up: высокий риск — ужесточаем сессию (короткое время жизни,
-    # обязательная ступень 2), но не отклоняем корректную аутентификацию.
+    # Политика step-up: средний/высокий риск -> ужесточение сеанса.
+    # стадия "step_up": ступень 2 (TOTP) обязательна, и после неё вход
+    # завершается только подтверждением резервным кодом (третий фактор).
+    # При verdict == "block" время жизни промежуточной стадии минимально.
+    stage = "step_up" if need_step_up else "mfa"
     ttl = 60.0 if verdict != "allow" else 120.0
-    tok = store.create_session(u.id, "mfa", ip, agent, ttl=ttl)
+    tok = store.create_session(u.id, stage, ip, agent, ttl=ttl)
     resp = _redirect(request, "/mfa")
     _set_cookie(resp, tok)
     return resp
@@ -208,6 +234,8 @@ async def _dummy_hash(pw: str) -> None:
 
 
 def _set_cookie(resp, token: str) -> None:
+    # secure=False — осознанное ограничение учебного стенда (запуск по HTTP
+    # на localhost). Перед эксплуатацией за HTTPS установить secure=True.
     resp.set_cookie(
         SESSION_COOKIE, token,
         httponly=True, samesite="lax", secure=False,  # secure=True за HTTPS в проде
@@ -238,7 +266,7 @@ def _known_ua(user_id: str) -> str | None:
 @app.post("/verify-totp")
 async def verify_totp(request: Request, code: str = Form(...)):
     s = current_session(request)
-    if not s or s["stage"] != "mfa":
+    if not s or s["stage"] not in ("mfa", "step_up"):
         return JSONResponse({"error": "Сессия не найдена. Начните вход заново."}, 401)
     u = user_of(s)
     ip = client_ip(request)
@@ -263,9 +291,18 @@ async def verify_totp(request: Request, code: str = Form(...)):
         return JSONResponse({"error": "Неверный или просроченный код."}, 401)
 
     risk.remember_code(u.id, code)
-    store.set_session_stage(s["token"], "authed")
     u.failed_attempts = 0
     store.update_user(u)
+
+    if s["stage"] == "step_up":
+        # Высокий риск: TOTP пройден, но сеанс остаётся на ступени
+        # подтверждения резервным кодом (третий фактор).
+        store.audit("auth.step_up.totp_ok", actor=u.login, ip=ip,
+                    details={"reason": "risk-based step-up"})
+        return JSONResponse({"ok": False, "step_up": True,
+                             "message": "Вход с высоким риском: подтвердите резервным кодом."})
+
+    store.set_session_stage(s["token"], "authed")
     store.audit("auth.success", actor=u.login, ip=ip,
                 details={"factors": ["password", "totp"]})
     return JSONResponse({"ok": True, "redirect": "/"})
@@ -274,7 +311,7 @@ async def verify_totp(request: Request, code: str = Form(...)):
 @app.post("/verify-recovery")
 async def verify_recovery(request: Request, code: str = Form(...)):
     s = current_session(request)
-    if not s or s["stage"] != "mfa":
+    if not s or s["stage"] not in ("mfa", "step_up"):
         return JSONResponse({"error": "Сессия не найдена."}, 401)
     u = user_of(s)
     ip = client_ip(request)
@@ -286,6 +323,17 @@ async def verify_recovery(request: Request, code: str = Form(...)):
             security.constant_time_eq(h, stored) for stored in u.recovery_hashes):
         u.recovery_hashes.remove(h)          # одноразовость
         store.update_user(u)
+        if s["stage"] == "step_up" and not risk.step_up_done(s["token"]):
+            # Step-up по риску: резервный код — ТРЕТИЙ фактор, он не заменяет
+            # TOTP. Сессия остаётся на ступени 2 до ввода кода из приложения.
+            risk.mark_step_up_done(s["token"])
+            store.audit("auth.step_up.recovery_ok", actor=u.login, ip=ip,
+                        details={"remaining": len(u.recovery_hashes)})
+            return JSONResponse({
+                "ok": False, "step_up_pending": True,
+                "message": "Резервный код принят. Теперь введите текущий TOTP-код "
+                           "из приложения для завершения входа.",
+                "warning": f"Резервных кодов осталось: {len(u.recovery_hashes)}."})
         store.set_session_stage(s["token"], "authed")
         store.audit("auth.success_recovery", actor=u.login, ip=ip)
         return JSONResponse({"ok": True, "redirect": "/",
@@ -310,11 +358,30 @@ async def enroll_totp_start(request: Request):
     u.mfa_enabled = False   # включится только после подтверждения кодом
     store.update_user(u)
     uri = security.totp_provisioning_uri(seed, u.login)
-    totp_preview = security.totp_now(seed)  # для демо/отладки (в проде убрать!)
     store.audit("enroll.totp.started", actor=u.login, ip=client_ip(request))
-    return JSONResponse({"otpauth_uri": uri, "secret_b32": _b32(seed),
-                         "qr_png": security.qr_png_data_uri(uri),
-                         "demo_current_code": totp_preview})
+    # Никаких секретов и текущих кодов в ответе: QR (otpauth:// URI) —
+    # единственный канал передачи секрета устройству пользователя.
+    # Ручной ввод Base32-секрета доступен на странице владельцу активной
+    # setup-сессии отдельным запросом /enroll/totp/secret.
+    return JSONResponse({"otpauth_uri": uri, "qr_png": security.qr_png_data_uri(uri)})
+
+
+@app.post("/enroll/totp/secret")
+async def enroll_totp_secret(request: Request):
+    """Base32-секрет для пользователей без камеры — по запросу, не по умолчанию.
+
+    Разграничение: показ секрета — событие аудита; сам секрет не отдаётся
+    вместе с QR, чтобы отладочная выдача не осталась в основном потоке
+    привязки перед реальной эксплуатацией.
+    """
+    s = current_session(request)
+    if not s or s["stage"] != "setup":
+        return JSONResponse({"error": "Требуется активная сессия привязки."}, 401)
+    u = user_of(s)
+    if u is None or u.totp_enc is None:
+        return JSONResponse({"error": "Нет незавершённой привязки."}, 400)
+    store.audit("enroll.totp.secret_shown", actor=u.login, ip=client_ip(request))
+    return JSONResponse({"secret_b32": _b32(security.decrypt_secret(u.totp_enc))})
 
 
 def _b32(b: bytes) -> str:
@@ -363,6 +430,7 @@ async def logout(request: Request):
     s = current_session(request)
     if s:
         store.drop_session(s["token"])
+        risk.clear_step_up(s["token"])
         store.audit("session.logout", actor=s["user_id"], ip=client_ip(request))
     resp = _redirect(request, "/login")
     resp.delete_cookie(SESSION_COOKIE)
@@ -370,16 +438,255 @@ async def logout(request: Request):
 
 
 # --------------------------------------------------------------------------- #
-# API для интеграции демонстрационной ИС (проверка токена сессии)
+# Контракт интеграции с ИС организации (полное описание — docs/integration.md)
 # --------------------------------------------------------------------------- #
+def _session_info(s: dict) -> dict:
+    u = user_of(s)
+    return {
+        "subject": u.login if u else None,
+        "full_name": u.full_name if u else None,
+        "stage": s["stage"],
+        "authenticated": s["stage"] == "authed",
+        "factors": ["password", "totp"] if s["stage"] == "authed" else [],
+        "risk_score": s["risk_score"],
+        "ip": s["ip"],
+        "expires_at": s["expires_at"],
+    }
+
+
 @app.get("/api/whoami")
 async def whoami(request: Request):
+    """Проверка текущей cookie-сессии (браузерный сценарий демонстрационной ИС)."""
     s = current_session(request)
     if not s or s["stage"] != "authed":
         return JSONResponse({"authenticated": False}, 401)
     u = user_of(s)
     return JSONResponse({"authenticated": True, "login": u.login,
                          "full_name": u.full_name, "mfa": u.mfa_enabled})
+
+
+INTEGRATION_KEY_ENV = "MFA_INTEGRATION_KEY"
+
+
+def _check_service_key(request: Request) -> bool:
+    """Сервисный ключ ИС (X-Service-Key). Для стенда задаётся переменной
+    окружения; в промышленной версии заменяется mTLS/OIDC-токеном."""
+    key = os.environ.get(INTEGRATION_KEY_ENV)
+    if not key:
+        return False          # интеграция не включена на стенде
+    return security.constant_time_eq(request.headers.get("x-service-key", ""), key)
+
+
+def _require_service_key(request: Request) -> JSONResponse | None:
+    if not _check_service_key(request):
+        store.audit("integration.denied", ip=client_ip(request), success=False)
+        return JSONResponse(
+            {"error": "Интеграция не настроена или неверный X-Service-Key "
+                      "(переменная окружения MFA_INTEGRATION_KEY). "
+                      "См. docs/integration.md."}, 403)
+    return None
+
+
+@app.post("/api/auth/login")
+async def api_auth_login(request: Request):
+    """Шаг 1 для ИС: проверка пароля, оценка риска, создание stages-сессии.
+
+    Вход: JSON {login, password}. Ответ: stage (mfa|step_up|setup), id сессии,
+    TTL. При верном пароле сессия ещё НЕ авторизована — доступ к ИС выдаётся
+    только после успешного /api/auth/totp (или /api/auth/recovery).
+    """
+    denied = _require_service_key(request)
+    if denied:
+        return denied
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Ожидается JSON."}, 400)
+    login = str(body.get("login", "")).strip()
+    password = str(body.get("password", ""))
+    ip = client_ip(request)
+    agent = ua(request)[:200]
+
+    if risk.rate_limited(ip):
+        store.audit("integration.auth.rate_limit", actor=login, ip=ip, success=False)
+        return JSONResponse({"error": "rate_limited"}, 429)
+
+    u = store.get_user_by_login(login)
+    if u is None:
+        await _dummy_hash(password)
+        store.audit("integration.auth.fail", actor=login, ip=ip, success=False)
+        return JSONResponse({"error": "invalid_credentials"}, 401)
+    if risk.is_locked(u):
+        store.audit("integration.auth.locked", actor=u.login, ip=ip, success=False)
+        return JSONResponse({"error": "account_locked"}, 403)
+
+    ok, needs_rehash = security.verify_password(password, u.pass_hash)
+    if not ok:
+        risk.apply_failed_attempt(u, ip)
+        store.update_user(u)
+        store.audit("integration.auth.fail", actor=u.login, ip=ip, success=False,
+                    details={"failed_total": u.failed_attempts})
+        return JSONResponse({"error": "invalid_credentials"}, 401)
+
+    score, reasons = risk.score_login(ip, agent, _known_ua(u.id),
+                                      u.failed_attempts, None)
+    verdict = risk.decision(score)
+    need_step_up = (risk.require_step_up(verdict, score) and u.mfa_enabled
+                    and bool(u.recovery_hashes))
+
+    u.failed_attempts = 0
+    if needs_rehash:
+        u.pass_hash = security.hash_password(password)
+    store.update_user(u)
+
+    if not u.mfa_enabled:
+        tok = store.create_session(u.id, "setup", ip, agent, ttl=10 * 60,
+                                   risk_score=score)
+        store.audit("integration.auth.stage1", actor=u.login, ip=ip,
+                    details={"stage": "setup", "score": score, "reasons": reasons})
+        return JSONResponse({"stage": "setup", "session": tok, "ttl": 600,
+                             "risk": {"score": score, "decision": verdict,
+                                      "reasons": reasons}})
+
+    tok = store.create_session(u.id, "step_up" if need_step_up else "mfa",
+                               ip, agent, ttl=60.0 if verdict != "allow" else 120.0,
+                               risk_score=score)
+    store.audit("integration.auth.stage1", actor=u.login, ip=ip,
+                details={"stage": "step_up" if need_step_up else "mfa",
+                         "score": score, "reasons": reasons})
+    return JSONResponse({"stage": "step_up" if need_step_up else "mfa",
+                         "session": tok,
+                         "ttl": 60.0 if verdict != "allow" else 120.0,
+                         "risk": {"score": score, "decision": verdict,
+                                  "reasons": reasons}})
+
+
+@app.post("/api/auth/totp")
+async def api_auth_totp(request: Request):
+    """Шаг 2 для ИС: проверка TOTP по session_id. На стадии step_up требует
+    дополнительно резервный код (см. ответ step_up=true)."""
+    denied = _require_service_key(request)
+    if denied:
+        return denied
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Ожидается JSON."}, 400)
+    tok = str(body.get("session", ""))
+    code = str(body.get("code", "")).replace(" ", "")
+    s = store.get_session(tok)
+    if not s or s["stage"] not in ("mfa", "step_up"):
+        return JSONResponse({"error": "session_not_found"}, 401)
+    u = user_of(s)
+    ip = client_ip(request)
+    if u is None or u.totp_enc is None:
+        return JSONResponse({"error": "factor_not_enrolled"}, 403)
+
+    if risk.code_already_used(u.id, code):
+        store.audit("integration.auth.fail.replay", actor=u.login, ip=ip, success=False)
+        return JSONResponse({"error": "code_replay_detected"}, 401)
+
+    seed = security.decrypt_secret(u.totp_enc)
+    if not security.verify_totp(seed, code):
+        risk.apply_failed_attempt(u, ip)
+        store.update_user(u)
+        store.audit("integration.auth.fail.totp", actor=u.login, ip=ip, success=False)
+        return JSONResponse({"error": "invalid_code"}, 401)
+
+    risk.remember_code(u.id, code)
+    u.failed_attempts = 0
+    store.update_user(u)
+
+    if s["stage"] == "step_up":
+        store.audit("integration.auth.step_up.totp_ok", actor=u.login, ip=ip)
+        return JSONResponse({"ok": False, "step_up": True,
+                             "message": "Требуется подтверждение резервным кодом."})
+
+    store.set_session_stage(tok, "authed")
+    store.audit("integration.auth.success", actor=u.login, ip=ip,
+                details={"factors": ["password", "totp"]})
+    return JSONResponse({"ok": True, "result": "granted",
+                         "subject": u.login, "session": tok,
+                         "ttl": store.AUTHED_TTL})
+
+
+@app.post("/api/auth/recovery")
+async def api_auth_recovery(request: Request):
+    """Шаг 2 (альтернатива) для ИС: резервный код вместо TOTP."""
+    denied = _require_service_key(request)
+    if denied:
+        return denied
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Ожидается JSON."}, 400)
+    tok = str(body.get("session", ""))
+    code = str(body.get("code", ""))
+    s = store.get_session(tok)
+    if not s or s["stage"] not in ("mfa", "step_up"):
+        return JSONResponse({"error": "session_not_found"}, 401)
+    u = user_of(s)
+    ip = client_ip(request)
+    if u is None:
+        return JSONResponse({"error": "session_not_found"}, 401)
+
+    h = security.hash_recovery_code(code)
+    if not (u.recovery_hashes and any(
+            security.constant_time_eq(h, stored) for stored in u.recovery_hashes)):
+        store.audit("integration.auth.fail.recovery", actor=u.login, ip=ip, success=False)
+        return JSONResponse({"error": "invalid_code"}, 401)
+
+    u.recovery_hashes.remove(h)
+    store.update_user(u)
+
+    if s["stage"] == "step_up" and not risk.step_up_done(tok):
+        risk.mark_step_up_done(tok)
+        store.audit("integration.auth.step_up.recovery_ok", actor=u.login, ip=ip)
+        return JSONResponse({"ok": False, "step_up_pending": True,
+                             "message": "Резервный код принят, требуется текущий TOTP.",
+                             "remaining_recovery_codes": len(u.recovery_hashes)})
+
+    store.set_session_stage(tok, "authed")
+    store.audit("integration.auth.success_recovery", actor=u.login, ip=ip,
+                details={"remaining": len(u.recovery_hashes)})
+    return JSONResponse({"ok": True, "result": "granted", "subject": u.login,
+                         "session": tok, "ttl": store.AUTHED_TTL,
+                         "remaining_recovery_codes": len(u.recovery_hashes)})
+
+
+@app.get("/api/introspect")
+async def api_introspect(request: Request, session: str = ""):
+    """Интроспекция сессии аутентификации для ИС (аналог RFC 7662).
+
+    ИС передаёт session_id, полученный в шаге 2; сервис возвращает субъекта,
+    пройденные факторы, оценку риска и факт истечения. Ответ может кэшироваться
+    ИС не дольше оставшегося TTL.
+    """
+    denied = _require_service_key(request)
+    if denied:
+        return denied
+    s = store.get_session(session)
+    if not s:
+        return JSONResponse({"active": False}, 200)
+    return JSONResponse({"active": s["stage"] == "authed", **_session_info(s)})
+
+
+@app.post("/api/auth/logout")
+async def api_auth_logout(request: Request):
+    """Завершение сеанса по инициативе ИС (single logout для данной сессии)."""
+    denied = _require_service_key(request)
+    if denied:
+        return denied
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    tok = str(body.get("session", ""))
+    if store.get_session(tok):
+        store.drop_session(tok)
+        risk.clear_step_up(tok)
+        store.audit("integration.session.logout", ip=client_ip(request))
+    return JSONResponse({"ok": True})
 
 
 @app.on_event("startup")

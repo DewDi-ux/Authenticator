@@ -23,12 +23,13 @@
            style="display:block;width:230px;height:230px;image-rendering:pixelated;border:1px solid #e2e8f0;border-radius:10px;padding:6px;background:#fff;margin:8px 0">
       <details style="margin:6px 0">
         <summary style="font-size:.8rem;cursor:pointer;color:#475569">
-          Не получается отсканировать? Введите секрет вручную</summary>
-        <p style="font-size:.8rem">Секретный ключ (Base32):</p>
-        <code id="secret"></code>
-        <p style="font-size:.75rem;color:#64748b">otpauth:// URI: <span id="uri" style="word-break:break-all"></span></p>
+          Не получается отсканировать? Показать секрет для ручного ввода</summary>
+        <p style="font-size:.8rem">Секрет не передаётся вместе с QR — запросите его
+           явно (показ фиксируется в журнале аудита):</p>
+        <button id="btn-secret" type="button" style="background:#64748b">Показать Base32-секрет</button>
+        <p style="font-size:.8rem;display:none" id="secretp">Секретный ключ (Base32):
+           <code id="secret"></code></p>
       </details>
-      <p style="font-size:.8rem; margin-top:10px">Демо-код прямо сейчас (для стенда): <code id="demo-code"></code></p>
       <form id="confirm-form" autocomplete="off">
         <label>Шаг 2. Код из приложения</label>
         <input name="code" type="text" inputmode="numeric" placeholder="123456" required>
@@ -67,10 +68,17 @@ if (btn) btn.addEventListener("click", async () => {
   // QR-код с otpauth:// URI: Яндекс.Ключ распознаёт его камерой и
   // сам добавляет аккаунт — ручной ввод секрета не требуется.
   document.getElementById("qr").src = d.qr_png || "/enroll/totp/qr.png";
-  document.getElementById("secret").textContent = d.secret_b32;
-  document.getElementById("uri").textContent = d.otpauth_uri;
-  document.getElementById("demo-code").textContent = d.demo_current_code;
   document.getElementById("qrbox").style.display = "block";
+});
+// Секрет — только по явному запросу пользователя (не по умолчанию, без демо-кодов)
+const bs = document.getElementById("btn-secret");
+if (bs) bs.addEventListener("click", async () => {
+  const r = await fetch("/enroll/totp/secret", {method:"POST"});
+  const d = await r.json();
+  if (!d.secret_b32) { alert(d.error||"Ошибка"); return; }
+  document.getElementById("secret").textContent = d.secret_b32;
+  document.getElementById("secretp").style.display = "block";
+  bs.style.display = "none";
 });
 const cf = document.getElementById("confirm-form");
 if (cf) cf.addEventListener("submit", async ev => {
