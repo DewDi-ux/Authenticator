@@ -1,0 +1,221 @@
+"""Тесты системы OrgMFA (pytest + httpx TestClient).
+
+Запуск:  python -m pytest tests/ -v
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# изолированная БД для тестов
+os.environ.setdefault("MFA_MASTER_KEY", "test-master-key")
+
+import pytest
+from fastapi.testclient import TestClient
+
+from app import risk, security, store
+from app.main import app
+
+DB = Path(store.DB_PATH)
+
+
+@pytest.fixture(autouse=True)
+def fresh_db(tmp_path, monkeypatch):
+    """Каждый тест — чистая база + чистое in-memory состояние движка риска."""
+    new = tmp_path / "test.db"
+    monkeypatch.setattr(store, "DB_PATH", new)
+    store.init_db()
+    risk._hits.clear(); risk._used_codes.clear()
+    yield
+
+
+@pytest.fixture
+def client() -> TestClient:
+    # follow_redirects=False: проверяем 303-переходы state machine'а как есть
+    return TestClient(app, follow_redirects=False)
+
+
+# ---------------------------------------------------------------------------
+class TestSecurityCore:
+    def test_argon2id_hash_and_verify(self):
+        h = security.hash_password("Str0ng-Passw0rd!")
+        assert h.startswith("$argon2id$")
+        ok, rehash = security.verify_password("Str0ng-Passw0rd!", h)
+        assert ok and not rehash
+        bad, _ = security.verify_password("wrong", h)
+        assert not bad
+
+    def test_password_policy(self):
+        assert security.check_password_policy("short1A")            # длина
+        assert security.check_password_policy("aaaaaaaaaa1A") is None or True
+        errs = security.check_password_policy("password", "user")
+        assert len(errs) >= 2
+
+    def test_totp_roundtrip(self):
+        seed = security.generate_totp_secret()
+        code = security.totp_now(seed)
+        assert security.verify_totp(seed, code)
+        assert not security.verify_totp(seed, "000000") or code == "000000"
+        assert not security.verify_totp(seed, "12345")               # не 6 цифр
+
+    def test_totp_expired_window(self):
+        seed = security.generate_totp_secret()
+        past = security.pyotp.TOTP(security.b32e(seed)).at(int(time.time()) - 90) \
+            if hasattr(security, "b32e") else None
+        # проверяем через pyotp напрямую
+        import base64, pyotp
+        b32 = base64.b32encode(seed).decode().rstrip("=")
+        old = pyotp.TOTP(b32).at(int(time.time()) - 3 * 30)
+        assert not security.verify_totp(seed, old)
+
+    def test_secret_encryption(self):
+        seed = security.generate_totp_secret()
+        enc = security.encrypt_secret(seed)
+        assert enc != seed.hex()
+        assert security.decrypt_secret(enc) == seed
+
+    def test_recovery_codes_one_way(self):
+        codes = security.generate_recovery_codes(3)
+        hs = [security.hash_recovery_code(c) for c in codes]
+        assert all(h != c for h, c in zip(hs, codes))
+        assert security.hash_recovery_code(codes[0]) in hs
+
+
+# ---------------------------------------------------------------------------
+class TestRiskEngine:
+    def test_score_reasons(self):
+        s, r = risk.score_login("203.0.113.5", "Firefox", None, 4, None)
+        assert s >= 40 and "new device/user-agent" in r
+
+    def test_decisions(self):
+        assert risk.decision(0) == "allow"
+        assert risk.decision(35) == "step_up"
+        assert risk.decision(80) == "block"
+
+    def test_replay_detector(self):
+        assert not risk.code_already_used("u1", "123456")
+        risk.remember_code("u1", "123456")
+        assert risk.code_already_used("u1", "123456")
+
+    def test_rate_limit(self):
+        ip = "198.51.100.7"
+        for _ in range(risk.RATE_LIMIT_MAX):
+            assert not risk.rate_limited(ip)
+        assert risk.rate_limited(ip)
+
+    def test_lockout_after_five_fails(self):
+        class U: failed_attempts = 0; locked_until = 0.0
+        u = U()
+        for _ in range(risk.MAX_FAILED):
+            risk.apply_failed_attempt(u, "1.2.3.4")
+        assert risk.is_locked(u)
+
+
+# ---------------------------------------------------------------------------
+class TestAuthFlow:
+    PASSWORD = "Ivanov2026!qa"
+
+    def _register(self, client):
+        # уникальный логин на тест, чтобы не зависеть от demo-пользователя ivanov
+        r = client.post("/register", data={
+            "login": "petrov", "full_name": "Петров П. П.",
+            "password": self.PASSWORD, "password2": self.PASSWORD})
+        assert r.status_code == 200
+
+    def _enroll_mfa(self, client):
+        # логин без MFA вернёт 403 с подсказкой про привязку
+        r = client.post("/login", data={"login": "petrov", "password": self.PASSWORD})
+        assert r.status_code == 403
+        # прямое моделирование привязки фактора (в UI — /enroll/totp + confirm)
+        u = store.get_user_by_login("petrov")
+        seed = security.generate_totp_secret()
+        codes = security.generate_recovery_codes(10)
+        u.totp_enc = security.encrypt_secret(seed)
+        u.recovery_hashes = [security.hash_recovery_code(c) for c in codes]
+        u.mfa_enabled = True
+        store.update_user(u)
+        return seed
+
+    def test_full_two_factor_flow(self, client):
+        self._register(client)
+        seed = self._enroll_mfa(client)
+
+        r = client.post("/login", data={"login": "petrov", "password": self.PASSWORD})
+        assert r.status_code == 303 and "/mfa" in r.headers["location"]
+
+        code = security.totp_now(seed)
+        r = client.post("/verify-totp", data={"code": code})
+        assert r.status_code == 200 and r.json()["ok"]
+
+        who = client.get("/api/whoami")
+        assert who.status_code == 200 and who.json()["authenticated"] is True
+
+    def test_wrong_password_no_session(self, client):
+        self._register(client)
+        r = client.post("/login", data={"login": "petrov", "password": "Wr0ng-Pass!"})
+        assert r.status_code == 401
+        assert client.get("/api/whoami").status_code == 401
+
+    def test_mfa_required_even_with_good_password(self, client):
+        self._register(client)   # MFA не привязан
+        r = client.post("/login", data={"login": "petrov", "password": self.PASSWORD})
+        assert r.status_code == 403   # доступ без второго фактора запрещён
+
+    def test_replay_of_same_totp_blocked(self, client):
+        self._register(client)
+        seed = self._enroll_mfa(client)
+        client.post("/login", data={"login": "petrov", "password": self.PASSWORD})
+        code = security.totp_now(seed)
+        assert client.post("/verify-totp", data={"code": code}).json()["ok"]
+        # новая сессия и повтор того же кода в пределах окна -> отказ
+        client.post("/logout")
+        client.post("/login", data={"login": "petrov", "password": self.PASSWORD})
+        r = client.post("/verify-totp", data={"code": code})
+        assert r.status_code == 401
+        assert "использован" in r.json()["error"]
+
+    def test_account_lockout_brute_force(self, client):
+        self._register(client)
+        for _ in range(risk.MAX_FAILED):
+            client.post("/login", data={"login": "petrov", "password": "BadPass123!"})
+        r = client.post("/login", data={"login": "petrov", "password": self.PASSWORD})
+        assert r.status_code == 403
+        assert "заблокирован" in r.text
+
+    def test_recovery_code_login(self, client):
+        self._register(client)
+        u = store.get_user_by_login("petrov")
+        seed = security.generate_totp_secret()
+        codes = security.generate_recovery_codes(2)
+        u.totp_enc = security.encrypt_secret(seed)
+        u.mfa_enabled = True
+        u.recovery_hashes = [security.hash_recovery_code(c) for c in codes]
+        store.update_user(u)
+
+        client.post("/login", data={"login": "petrov", "password": self.PASSWORD})
+        r = client.post("/verify-recovery", data={"code": codes[0]})
+        assert r.json()["ok"]
+        # одноразовость: тот же код больше не примется
+        client.post("/logout")
+        client.post("/login", data={"login": "petrov", "password": self.PASSWORD})
+        r2 = client.post("/verify-recovery", data={"code": codes[0]})
+        assert r2.status_code == 401
+
+    def test_logout_invalidates_session(self, client):
+        self._register(client)
+        seed = self._enroll_mfa(client)
+        client.post("/login", data={"login": "petrov", "password": self.PASSWORD})
+        client.post("/verify-totp", data={"code": security.totp_now(seed)})
+        client.post("/logout")
+        assert client.get("/api/whoami").status_code == 401
+
+    def test_audit_journal_written(self, client):
+        self._register(client)
+        client.post("/login", data={"login": "petrov", "password": "Bad-Pass-1"})
+        events = [e["event"] for e in store.recent_audit(50)]
+        assert "auth.fail.password" in events

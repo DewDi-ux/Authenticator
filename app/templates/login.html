@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Вход — OrgMFA{% endblock %}
+{% block content %}
+  <h1>Вход в корпоративную ИС</h1>
+  <div class="sub">Ступень 1 из 2 — проверка пароля</div>
+  <div class="steps"><div class="step on"></div><div class="step"></div></div>
+
+  {% if msg %}<div class="msg err">{{ msg }}</div>{% endif %}
+
+  <form method="post" action="/login" autocomplete="off">
+    <label for="login">Логин</label>
+    <input id="login" name="login" type="text" required autofocus>
+    <label for="password">Пароль</label>
+    <input id="password" name="password" type="password" required>
+    <button type="submit">Далее →</button>
+  </form>
+  <div class="links">Нет учётной записи? <a href="/register">Регистрация</a></div>
+{% endblock %}
