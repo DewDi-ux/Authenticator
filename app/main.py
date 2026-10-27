@@ -74,14 +74,14 @@ async def index(request: Request):
     if s and s["stage"] == "authed":
         u = user_of(s)
         return templates.TemplateResponse(
-            "dashboard.html", {"request": request, "user": u,
-                               "audit": store.recent_audit(15)})
+            request, "dashboard.html",
+            {"user": u, "audit": store.recent_audit(15)})
     return _redirect(request, "/login")
 
 
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request):
-    return templates.TemplateResponse("login.html", {"request": request, "msg": ""})
+    return templates.TemplateResponse(request, "login.html", {"msg": ""})
 
 
 @app.get("/mfa", response_class=HTMLResponse)
@@ -89,12 +89,12 @@ async def mfa_page(request: Request):
     s = current_session(request)
     if not s or s["stage"] != "mfa":
         return _redirect(request, "/login")
-    return templates.TemplateResponse("mfa.html", {"request": request})
+    return templates.TemplateResponse(request, "mfa.html")
 
 
 @app.get("/register", response_class=HTMLResponse)
 async def register_page(request: Request):
-    return templates.TemplateResponse("register.html", {"request": request, "msg": ""})
+    return templates.TemplateResponse(request, "register.html", {"msg": ""})
 
 
 # --------------------------------------------------------------------------- #
@@ -107,17 +107,17 @@ async def register(request: Request, login: str = Form(...),
     ip = client_ip(request)
     if password != password2:
         msg = "Пароли не совпадают."
-        return templates.TemplateResponse("register.html", {"request": request, "msg": msg}, status_code=400)
+        return templates.TemplateResponse(request, "register.html", {"msg": msg}, status_code=400)
     try:
         store.create_user(login.strip(), password, full_name.strip())
     except ValueError as e:
         store.audit("user.register_failed", actor=login, ip=ip, success=False,
                     details={"reason": str(e)})
-        return templates.TemplateResponse("register.html", {"request": request, "msg": str(e)}, status_code=400)
+        return templates.TemplateResponse(request, "register.html", {"msg": str(e)}, status_code=400)
     store.audit("user.registered_ok", actor=login, ip=ip)
     return templates.TemplateResponse(
-        "register.html",
-        {"request": request, "msg": "Учётная запись создана. Привяжите телефон к приложению-аутентификатору и войдите."},
+        request, "register.html",
+        {"msg": "Учётная запись создана. Привяжите телефон к приложению-аутентификатору и войдите."},
     )
 
 
@@ -131,8 +131,8 @@ async def login(request: Request, login: str = Form(...), password: str = Form(.
     if risk.rate_limited(ip):
         store.audit("auth.rate_limit", actor=login, ip=ip, success=False)
         return templates.TemplateResponse(
-            "login.html",
-            {"request": request, "msg": "Слишком много попыток. Повторите позже (защита от перебора)."},
+            request, "login.html",
+            {"msg": "Слишком много попыток. Повторите позже (защита от перебора)."},
             status_code=429)
 
     u = store.get_user_by_login(login.strip())
@@ -145,9 +145,8 @@ async def login(request: Request, login: str = Form(...), password: str = Form(.
     if risk.is_locked(u):
         store.audit("auth.fail.locked", actor=u.login, ip=ip, success=False)
         return templates.TemplateResponse(
-            "login.html",
-            {"request": request,
-             "msg": f"Учётная запись временно заблокирована после {risk.MAX_FAILED} неудачных попыток."},
+            request, "login.html",
+            {"msg": f"Учётная запись временно заблокирована после {risk.MAX_FAILED} неудачных попыток."},
             status_code=403)
 
     ok, needs_rehash = security.verify_password(password, u.pass_hash)
@@ -177,9 +176,8 @@ async def login(request: Request, login: str = Form(...), password: str = Form(.
         # без привязанного фактора доступ запрещён (политика обязательной MFA)
         store.audit("auth.fail.no_factor", actor=u.login, ip=ip, success=False)
         return templates.TemplateResponse(
-            "login.html",
-            {"request": request,
-             "msg": "Пароль верный, но второй фактор не привязан. Пройдите привязку TOTP в личном кабинете."},
+            request, "login.html",
+            {"msg": "Пароль верный, но второй фактор не привязан. Пройдите привязку TOTP в личном кабинете."},
             status_code=403)
 
     # Политика step-up: высокий риск — ужесточаем сессию (короткое время жизни,
@@ -193,8 +191,8 @@ async def login(request: Request, login: str = Form(...), password: str = Form(.
 
 def _login_error(request: Request):
     return templates.TemplateResponse(
-        "login.html",
-        {"request": request, "msg": "Неверный логин или пароль."},
+        request, "login.html",
+        {"msg": "Неверный логин или пароль."},
         status_code=401)
 
 
@@ -277,8 +275,9 @@ async def verify_recovery(request: Request, code: str = Form(...)):
     if u is None:
         return JSONResponse({"error": "Пользователь не найден."}, 401)
 
-    h = security.hash_recovery_code(code.strip().upper())
-    if h in u.recovery_hashes:
+    h = security.hash_recovery_code(code)
+    if u.recovery_hashes and any(
+            security.constant_time_eq(h, stored) for stored in u.recovery_hashes):
         u.recovery_hashes.remove(h)          # одноразовость
         store.update_user(u)
         store.set_session_stage(s["token"], "authed")
@@ -364,4 +363,4 @@ async def startup() -> None:
     store.init_db()
     # демо-пользователь для защиты диссертационного показа
     if store.get_user_by_login("ivanov") is None:
-        store.create_user("ivanov", "Ivanov2026!qa", "Иванов А. П.")
+        store.create_user("ivanov", "Demo2026!passw0rd", "Иванов А. П.")
