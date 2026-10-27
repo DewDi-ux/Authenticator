@@ -184,9 +184,13 @@ async def login(request: Request, login: str = Form(...), password: str = Form(.
     # ужесточает сеанс (стадия step_up — вход возможен только после
     # подтверждения резервным кодом, см. /verify-totp и /verify-recovery).
     # Требование третьего фактора применимо только если он существует
-    # (коды выданы при подтверждённой привязке TOTP).
-    need_step_up = (risk.require_step_up(verdict, score) and u.mfa_enabled
-                    and bool(u.recovery_hashes))
+    # (коды выданы при подтверждённой привязке TOTP). Политика порога —
+    # в risk.require_step_up: одиночный бытовой признак вход не ужесточает.
+    need_step_up = (risk.require_step_up(verdict, score, reasons)
+                    and u.mfa_enabled and bool(u.recovery_hashes))
+    # служебный флаг стенда для демонстрации step-up сценария на защите
+    need_step_up = need_step_up or (_force_step_up(request) and u.mfa_enabled
+                                    and bool(u.recovery_hashes))
 
     # --- успешная 1-я ступень: сброс счётчика, rehash-upgrade ---
     u.failed_attempts = 0
@@ -260,6 +264,13 @@ def _known_ua(user_id: str) -> str | None:
     return r["user_agent"] if r else None
 
 
+def _force_step_up(request: Request) -> bool:
+    """Служебный флаг учебного стенда для защиты диссертационного показа:
+    X-Force-Step-Up: 1 имитирует высокий риск и включает стадию step_up без
+    подделки признаков. В промышленной версии удалён/запрещён политикой."""
+    return request.headers.get("x-force-step-up", "") in ("1", "true", "yes")
+
+
 # --------------------------------------------------------------------------- #
 # ШАГ 2: TOTP / резервный код
 # --------------------------------------------------------------------------- #
@@ -295,12 +306,24 @@ async def verify_totp(request: Request, code: str = Form(...)):
     store.update_user(u)
 
     if s["stage"] == "step_up":
-        # Высокий риск: TOTP пройден, но сеанс остаётся на ступени
-        # подтверждения резервным кодом (третий фактор).
+        # Высокий риск: фиксируем прохождение TOTP на сессии. Если резервный
+        # код уже был принят ранее (пользователь начал с него) — вход завершён;
+        # иначе ждём ОДИН резервный код. Повторного запроса TOTP не будет:
+        # пройденный фактор больше не проверяется (устранено «зацикливание»,
+        # расходующее два кода).
+        risk.mark_totp_step_done(s["token"])
+        if risk.recovery_step_done(s["token"]):
+            store.set_session_stage(s["token"], "authed")
+            risk.clear_step_up(s["token"])
+            store.audit("auth.success", actor=u.login, ip=ip,
+                        details={"factors": ["password", "recovery", "totp"],
+                                 "step_up": True})
+            return JSONResponse({"ok": True, "redirect": "/"})
         store.audit("auth.step_up.totp_ok", actor=u.login, ip=ip,
                     details={"reason": "risk-based step-up"})
         return JSONResponse({"ok": False, "step_up": True,
-                             "message": "Вход с высоким риском: подтвердите резервным кодом."})
+                             "message": "Вход с повышенным риском: TOTP принят. "
+                                        "Для завершения входа введите один резервный код."})
 
     store.set_session_stage(s["token"], "authed")
     store.audit("auth.success", actor=u.login, ip=ip,
@@ -323,10 +346,27 @@ async def verify_recovery(request: Request, code: str = Form(...)):
             security.constant_time_eq(h, stored) for stored in u.recovery_hashes):
         u.recovery_hashes.remove(h)          # одноразовость
         store.update_user(u)
-        if s["stage"] == "step_up" and not risk.step_up_done(s["token"]):
-            # Step-up по риску: резервный код — ТРЕТИЙ фактор, он не заменяет
-            # TOTP. Сессия остаётся на ступени 2 до ввода кода из приложения.
-            risk.mark_step_up_done(s["token"])
+        if s["stage"] == "step_up":
+            # Резервный код принят. Если TOTP уже пройден — вход завершается
+            # сразу (расход ОДНОГО кода). Иначе ждём текущий TOTP; повторный
+            # резервный код в этой сессии не расходуется (флаги на сессию).
+            if risk.totp_step_done(s["token"]):
+                store.set_session_stage(s["token"], "authed")
+                risk.clear_step_up(s["token"])
+                store.audit("auth.success", actor=u.login, ip=ip,
+                            details={"factors": ["password", "totp", "recovery"],
+                                     "step_up": True,
+                                     "remaining": len(u.recovery_hashes)})
+                return JSONResponse({"ok": True, "redirect": "/",
+                                     "warning": f"Вход выполнен. Резервных кодов осталось: "
+                                                f"{len(u.recovery_hashes)}."})
+            if risk.recovery_step_done(s["token"]):
+                # этот тип кода уже засчитан в данной сессии — новый код не тратится
+                return JSONResponse({
+                    "ok": False, "step_up_pending": True,
+                    "message": "Резервный код уже засчитан в этом входе. "
+                               "Введите текущий TOTP-код из приложения."})
+            risk.mark_recovery_step_done(s["token"])
             store.audit("auth.step_up.recovery_ok", actor=u.login, ip=ip,
                         details={"remaining": len(u.recovery_hashes)})
             return JSONResponse({
@@ -346,24 +386,63 @@ async def verify_recovery(request: Request, code: str = Form(...)):
 # Привязка TOTP (enrollment)
 # --------------------------------------------------------------------------- #
 @app.post("/enroll/totp")
-async def enroll_totp_start(request: Request):
+async def enroll_totp_start(request: Request, password: str = Form("")):
+    """Начало привязки TOTP.
+
+    Разрешена только на setup-сессии (после верного пароля без MFA) либо в
+    авторизованной сессии при ПОВТОРНОМ вводе пароля — иначе украденная cookie
+    позволила бы подменить фактор молча. При перевыпуске старые резервные коды
+    аннулируются; новые показываются пользователю ровно один раз.
+    """
     s = current_session(request)
     u = user_of(s) if s else None
     if u is None:
-        # demo-hint: на стенде разрешаем привязку по логину+паролю из формы
         return JSONResponse({"error": "Требуется активная сессия после шага 1."}, 401)
+    if s["stage"] == "authed":
+        ok, _ = security.verify_password(password, u.pass_hash)
+        if not ok:
+            store.audit("enroll.totp.denied", actor=u.login,
+                        ip=client_ip(request), success=False,
+                        details={"reason": "password_confirmation_failed"})
+            return JSONResponse({"error": "Для перевыпуска фактора подтвердите пароль."}, 403)
+    elif s["stage"] != "setup":
+        return JSONResponse({"error": "Привязка доступна сразу после входа или из личного кабинета."}, 403)
     seed = security.generate_totp_secret()
+    codes = security.generate_recovery_codes()
     u.totp_enc = security.encrypt_secret(seed)
-    u.recovery_hashes = [security.hash_recovery_code(c) for c in security.generate_recovery_codes()]
+    # plaintext коды возвращаются ОДИН раз и нигде не сохраняются —
+    # в БД идут только их хэши
+    u.recovery_hashes = [security.hash_recovery_code(c) for c in codes]
     u.mfa_enabled = False   # включится только после подтверждения кодом
     store.update_user(u)
     uri = security.totp_provisioning_uri(seed, u.login)
     store.audit("enroll.totp.started", actor=u.login, ip=client_ip(request))
-    # Никаких секретов и текущих кодов в ответе: QR (otpauth:// URI) —
+    # Никаких секретов и текущих TOTP-кодов в ответе: QR (otpauth:// URI) —
     # единственный канал передачи секрета устройству пользователя.
     # Ручной ввод Base32-секрета доступен на странице владельцу активной
     # setup-сессии отдельным запросом /enroll/totp/secret.
-    return JSONResponse({"otpauth_uri": uri, "qr_png": security.qr_png_data_uri(uri)})
+    return JSONResponse({"otpauth_uri": uri, "qr_png": security.qr_png_data_uri(uri),
+                         "recovery_codes": codes})
+
+
+@app.post("/recovery/regenerate")
+async def recovery_regenerate(request: Request, password: str = Form(...)):
+    """Перевыпуск резервных кодов из авторизованной сессии (с подтверждением
+    паролем). Старые коды аннулируются, новые показываются один раз."""
+    s = current_session(request)
+    u = user_of(s) if s else None
+    if not s or s["stage"] != "authed" or u is None:
+        return JSONResponse({"error": "Требуется авторизованная сессия."}, 401)
+    ok, _ = security.verify_password(password, u.pass_hash)
+    if not ok:
+        store.audit("recovery.regenerate.denied", actor=u.login,
+                    ip=client_ip(request), success=False)
+        return JSONResponse({"error": "Неверный пароль."}, 403)
+    codes = security.generate_recovery_codes()
+    u.recovery_hashes = [security.hash_recovery_code(c) for c in codes]
+    store.update_user(u)
+    store.audit("recovery.regenerated", actor=u.login, ip=client_ip(request))
+    return JSONResponse({"ok": True, "recovery_codes": codes})
 
 
 @app.post("/enroll/totp/secret")
@@ -528,15 +607,21 @@ async def api_auth_login(request: Request):
                     details={"failed_total": u.failed_attempts})
         return JSONResponse({"error": "invalid_credentials"}, 401)
 
+    last_login_ts = _last_success_ts(u.id)
+    minutes_since = (time.time() - last_login_ts) / 60 if last_login_ts else None
     score, reasons = risk.score_login(ip, agent, _known_ua(u.id),
-                                      u.failed_attempts, None)
+                                      u.failed_attempts, minutes_since)
     verdict = risk.decision(score)
-    need_step_up = (risk.require_step_up(verdict, score) and u.mfa_enabled
-                    and bool(u.recovery_hashes))
+    need_step_up = (risk.require_step_up(verdict, score, reasons)
+                    and u.mfa_enabled and bool(u.recovery_hashes))
+    # служебный флаг для интеграционных тестов/демо: X-Force-Step-Up: 1
+    need_step_up = need_step_up or (_force_step_up(request) and u.mfa_enabled
+                                    and bool(u.recovery_hashes))
 
     u.failed_attempts = 0
     if needs_rehash:
         u.pass_hash = security.hash_password(password)
+
     store.update_user(u)
 
     if not u.mfa_enabled:
@@ -598,9 +683,21 @@ async def api_auth_totp(request: Request):
     store.update_user(u)
 
     if s["stage"] == "step_up":
+        # Фиксируем TOTP на сессии; если резервный код уже принят — завершаем
+        # вход, иначе ждём ОДИН резервный код (без повторного запроса TOTP).
+        risk.mark_totp_step_done(tok)
+        if risk.recovery_step_done(tok):
+            store.set_session_stage(tok, "authed")
+            risk.clear_step_up(tok)
+            store.audit("integration.auth.success", actor=u.login, ip=ip,
+                        details={"factors": ["password", "recovery", "totp"],
+                                 "step_up": True})
+            return JSONResponse({"ok": True, "result": "granted",
+                                 "subject": u.login, "session": tok,
+                                 "ttl": store.AUTHED_TTL})
         store.audit("integration.auth.step_up.totp_ok", actor=u.login, ip=ip)
         return JSONResponse({"ok": False, "step_up": True,
-                             "message": "Требуется подтверждение резервным кодом."})
+                             "message": "Требуется подтверждение одним резервным кодом."})
 
     store.set_session_stage(tok, "authed")
     store.audit("integration.auth.success", actor=u.login, ip=ip,
@@ -639,8 +736,24 @@ async def api_auth_recovery(request: Request):
     u.recovery_hashes.remove(h)
     store.update_user(u)
 
-    if s["stage"] == "step_up" and not risk.step_up_done(tok):
-        risk.mark_step_up_done(tok)
+    if s["stage"] == "step_up":
+        # Резервный код принят: если TOTP уже пройден — вход завершается сразу
+        # (расход ОДНОГО кода); иначе ждём текущий TOTP. Повторный резервный
+        # код в этой же сессии не расходуется.
+        if risk.totp_step_done(tok):
+            store.set_session_stage(tok, "authed")
+            risk.clear_step_up(tok)
+            store.audit("integration.auth.success", actor=u.login, ip=ip,
+                        details={"factors": ["password", "totp", "recovery"],
+                                 "step_up": True})
+            return JSONResponse({"ok": True, "result": "granted", "subject": u.login,
+                                 "session": tok, "ttl": store.AUTHED_TTL,
+                                 "remaining_recovery_codes": len(u.recovery_hashes)})
+        if risk.recovery_step_done(tok):
+            return JSONResponse({"ok": False, "step_up_pending": True,
+                                 "message": "Резервный код уже засчитан, требуется текущий TOTP.",
+                                 "remaining_recovery_codes": len(u.recovery_hashes)})
+        risk.mark_recovery_step_done(tok)
         store.audit("integration.auth.step_up.recovery_ok", actor=u.login, ip=ip)
         return JSONResponse({"ok": False, "step_up_pending": True,
                              "message": "Резервный код принят, требуется текущий TOTP.",

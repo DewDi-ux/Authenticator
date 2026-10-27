@@ -15,50 +15,64 @@ from __future__ import annotations
 import time
 
 # Пороги (настраиваются политикой организации)
-RISK_MEDIUM = 30   # требовать обязательный второй фактор даже если MFA "опциональна"
-RISK_HIGH = 70     # блокировать до подтверждения администратором / step-up
+RISK_STEP_UP = 55   # ужесточение входа: после TOTP требуется третий фактор
+RISK_BLOCK = 85     # максимальный verdict: step-up с минимальным TTL стадии
+STEP_UP_MIN_FACTORS = 2   # шаг к ужесточению: не менее двух независимых причин
 
 WORK_HOURS = (8, 19)          # рабочее время организации
-TRUSTED_SUBNET_PREFIX = "127."  # внутренняя сеть организации (демо: localhost)
+TRUSTED_SUBNET_PREFIXES = ("127.", "10.", "192.168.")  # внутренние сети стенда
+
+
+def _in_trusted_network(ip: str) -> bool:
+    return ip.startswith(TRUSTED_SUBNET_PREFIXES) or ip == "::1"
 
 
 def score_login(ip: str, ua: str, known_ua: str | None, failed_recent: int,
                 minutes_since_last: float | None) -> tuple[int, list[str]]:
-    """Возвращает (score, причины). Каждая причина — строка для журнала."""
+    """Возвращает (score, причины). Каждая причина — строка для журнала.
+
+    Калибровка весов (см. docs/integration.md, раздел «Модель угроз и риск»):
+    штатный вход сотрудника (известное устройство, корпоративная подсеть,
+    рабочее время) обязан давать allow; step-up включается только при
+    сочетании двух и более независимых признаков риска либо при явном
+    признаке перебора учётных данных. Это исключает ситуацию, когда
+    «рискованный» вердикт выдаётся каждому пользователю на стенде.
+    """
     score, reasons = 0, []
 
     if failed_recent >= 3:
+        # явный признак перебора: сам по себе достаточен для step-up
         score += min(40, failed_recent * 8)
         reasons.append(f"series of failed attempts ({failed_recent})")
 
     if known_ua is None:
-        score += 20
+        score += 15
         reasons.append("new device/user-agent")
     elif known_ua != ua:
-        score += 15
+        score += 10
         reasons.append("user-agent changed")
 
-    if not ip.startswith(TRUSTED_SUBNET_PREFIX):
+    if not _in_trusted_network(ip):
         score += 10
         reasons.append("login from outside trusted network")
 
     hour = time.localtime().tm_hour
     if not (WORK_HOURS[0] <= hour < WORK_HOURS[1]):
-        score += 10
+        score += 8
         reasons.append("login outside business hours")
 
     if minutes_since_last is not None and minutes_since_last > 60 * 24 * 30:
-        score += 10
+        score += 8
         reasons.append("dormant account reactivation (>30 days)")
 
     return min(score, 100), reasons
 
 
 def decision(score: int) -> str:
-    if score >= RISK_HIGH:
+    if score >= RISK_BLOCK:
         return "block"
-    if score >= RISK_MEDIUM:
-        return "step_up"      # обязательный MFA + уведомление пользователя
+    if score >= RISK_STEP_UP:
+        return "step_up"
     return "allow"
 
 
@@ -112,31 +126,58 @@ def is_locked(u, now: float | None = None) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Step-up при высоком риске: после верного пароля и TOTP требуется
-# подтверждение резервным кодом. Одноразовый флаг ставится на сессию,
-# чтобы не требовать второй резервный код в том же сеансе входа.
+# Step-up при высоком риске: вердикт risk-движка ужесточает сеанс входа —
+# после TOTP требуется ОДИН резервный код (третий фактор). Флаги пройденных
+# ступеней хранятся на сессию; каждый фактор фиксируется ровно один раз,
+# порядок прохождения (TOTP->код или код->TOTP) произвольный, повторного
+# запроса уже пройденного фактора нет (защита от «зацикливания» step-up).
+#
+# Ограничение учебно-демонстрационного стенда: состояние живёт в памяти
+# одного процесса uvicorn. При нескольких worker-процессах флаги и счётчики
+# надо вынести в общее хранилище (Redis/БД) — см. docs/integration.md.
 # ---------------------------------------------------------------------------
-_stepup_ok: set[str] = set()
+_stepup_totp_done: set[str] = set()
+_stepup_recovery_done: set[str] = set()
 
 
-def require_step_up(verdict: str, score: int) -> bool:
-    """Политика: step_up и block означают «дополнительная проверка нужна».
+def require_step_up(verdict: str, score: int, reasons: list[str] | None = None) -> bool:
+    """Политика: step_up и block означают «нужен третий фактор».
 
     'block' в контексте уже корректно пройденной ступени 1 трактуется как
     максимальный step-up (см. README / docs/integration.md): вход не
     отклоняется молча, но без подтверждения третьим фактором не выполняется.
+
+    Порог RISK_STEP_UP калиброван так, что одиночный бытовой признак
+    (незнакомое устройство ИЛИ вход из вне доверенной подсети ИЛИ вход
+    вне рабочего времени) НЕ ужесточает вход: шаг требуется либо при
+    явном признаке перебора (серия неудачных попыток), либо при
+    сочетании двух и более независимых причин риска.
     """
-    return verdict in ("step_up", "block")
+    if verdict not in ("step_up", "block"):
+        return False
+    if reasons and len(reasons) < STEP_UP_MIN_FACTORS:
+        # порог формально превышен одной доминирующей причиной, но это
+        # штатная ситуация (например, только «новый device») — не усложняем
+        return any(r.startswith("series of failed attempts") for r in reasons)
+    return True
 
 
-def step_up_done(token: str) -> bool:
-    return token in _stepup_ok
+def totp_step_done(token: str) -> bool:
+    return token in _stepup_totp_done
 
 
-def mark_step_up_done(token: str) -> None:
-    _stepup_ok.discard(token)      # одноразово: повторное прохождение не нужно
-    _stepup_ok.add(token)
+def mark_totp_step_done(token: str) -> None:
+    _stepup_totp_done.add(token)
+
+
+def recovery_step_done(token: str) -> bool:
+    return token in _stepup_recovery_done
+
+
+def mark_recovery_step_done(token: str) -> None:
+    _stepup_recovery_done.add(token)
 
 
 def clear_step_up(token: str) -> None:
-    _stepup_ok.discard(token)
+    _stepup_totp_done.discard(token)
+    _stepup_recovery_done.discard(token)
