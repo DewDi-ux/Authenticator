@@ -150,6 +150,18 @@ def set_session_stage(token: str, stage: str, ttl: float = 8 * 3600) -> None:
                   (stage, time.time() + ttl, token))
 
 
+def touch_session(token: str, ttl: float = 15 * 60) -> None:
+    """Продлевает короткую life-сессию промежуточной стадии (mfa).
+
+    Нужно для сценария «первый вход»: пользователь ввёл верный пароль,
+    получил ссылку/QR для привязки TOTP, установил приложение на телефон
+    и вернулся подтвердить код — окно стадии не должно истечь за это время.
+    """
+    with _lock, _conn() as c:
+        c.execute("UPDATE sessions SET expires_at=? WHERE token=? AND stage='mfa'",
+                  (time.time() + ttl, token))
+
+
 def drop_session(token: str) -> None:
     with _lock, _conn() as c:
         c.execute("DELETE FROM sessions WHERE token=?", (token,))

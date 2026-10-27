@@ -133,14 +133,28 @@ def decrypt_secret(token: str) -> bytes:
 # ---------------------------------------------------------------------------
 # Резервные коды (потеря второго фактора)
 # ---------------------------------------------------------------------------
+def normalize_recovery_code(code: str) -> str:
+    """Приведение резервного кода к каноническому виду.
+
+    Коды генерируются в верхнем регистре и без неоднозначных символов,
+    поэтому пользователь может ввести их в любом регистре и с пробелами/
+    дефисами — нормализация делает ввод инвариантным (usability по NIST
+    SP 800-63B §5.2) при сохранении стойкости (энтропия не уменьшается).
+    """
+    return "".join(code.split()).upper()
+
+
 def generate_recovery_codes(count: int = RECOVERY_CODE_COUNT) -> list[str]:
-    return [base64.urlsafe_b64encode(secrets.token_bytes(RECOVERY_CODE_BYTES)).decode().rstrip("=")
+    # Алфавит без неоднозначных символов (O/0, I/1/l), код в верхнем регистре —
+    # удобно переписывать с бумаги; энтропия ~2^40 на код (secrets, CSPRNG).
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return ["".join(secrets.choice(alphabet) for _ in range(2 * RECOVERY_CODE_BYTES))
             for _ in range(count)]
 
 
 def hash_recovery_code(code: str) -> str:
     """Хэш кода для хранения (код выдаётся один раз, хранится только хэш)."""
-    return hashlib.sha256(("rc:" + code).encode()).hexdigest()
+    return hashlib.sha256(("rc:" + normalize_recovery_code(code)).encode()).hexdigest()
 
 
 def constant_time_eq(a: str, b: str) -> bool:
