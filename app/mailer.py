@@ -2,44 +2,56 @@
 app.mailer — отправка писем пользователю (восстановление пароля,
 уведомления о подозрительной активности).
 
-Транспорт: Resend API (https://api.resend.com/emails) — HTTPS + Bearer-токен,
-SMTP не требуется. Ключ берётся из переменной окружения RESEND_API_KEY,
-отправитель — из MAIL_FROM (по умолчанию onboarding@resend.dev — песочный
-домен Resend для тестов без верификации домена).
+Транспорт: Gmail SMTP (или любой другой SMTP-сервер) через STARTTLS.
+Все секреты берутся ТОЛЬКО из переменных окружения (файл .env не коммитится):
+
+    SMTP_USER      ящик отправителя, например you@gmail.com  (обязательно)
+    SMTP_PASS      App Password Gmail — 16 символов БЕЗ пробелов (обязательно)
+                   (Google Account → Security → 2-Step Verification →
+                    App passwords; обычный пароль аккаунта НЕ подойдёт)
+    SMTP_HOST      по умолчанию smtp.gmail.com
+    SMTP_PORT      по умолчанию 587 (STARTTLS); для 465 поставьте SMTP_SSL=1
+    SMTP_SSL       1 — использовать implicit TLS (порт 465), иначе STARTTLS
+    MAIL_FROM      адрес/имя в поле "From" (по умолчанию = SMTP_USER)
+
+Если SMTP_USER или SMTP_PASS не заданы, включается режим стенда "console":
+письмо не уходит в сеть, а записывается в журнал аудита и печатается в консоль.
+Для локальных прогонов pytest это безопасный вариант по умолчанию.
 
 Письма отправляются ФОНОВЫМ ЗАДАЧЕМ FastAPI (starlette BackgroundTasks),
 чтобы сетевая задержка не блокировала ответ аутентификации; ошибка доставки
 фиксируется в журнале аудита и НЕ влияет на результат входа.
-
-Если RESEND_API_KEY не задан, включается режим стенда "console": письмо
-не уходит в сеть, а записывается в журнал аудита (детали доставки при этом
-не светятся в HTTP-ответе). Для локальных прогонов pytest это безопасный
-вариант по умолчанию.
 """
 
 from __future__ import annotations
 
-import json
 import os
-import urllib.error
-import urllib.request
+import smtplib
+import ssl
+from email.header import Header
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.utils import formataddr, formatdate, make_msgid
+
+try:  # необязательная зависимость: если есть — подхватим .env автоматически
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:  # pragma: no cover - стенд работает и без python-dotenv
+    pass
 
 from . import store
 
-API_URL = "https://api.resend.com/emails"
-API_KEY_ENV = "RESEND_API_KEY"
-FROM_ENV = "MAIL_FROM"
-DEFAULT_FROM = "OrgMFA <onboarding@resend.dev>"
-TIMEOUT_SEC = 10
+TIMEOUT_SEC = 15
 
 
 def is_configured() -> bool:
-    """True, если задан ключ Resend (реальная доставка), иначе — console-стенд."""
-    return bool(os.environ.get(API_KEY_ENV))
+    """True, если заданы учётные данные SMTP (реальная доставка)."""
+    return bool(os.environ.get("SMTP_USER") and os.environ.get("SMTP_PASS"))
 
 
 def sender() -> str:
-    return os.environ.get(FROM_ENV) or DEFAULT_FROM
+    """Адрес отправителя из MAIL_FROM (по умолчанию — SMTP_USER)."""
+    return os.environ.get("MAIL_FROM") or os.environ.get("SMTP_USER", "")
 
 
 def send_email(to: str, subject: str, text_body: str,
@@ -49,42 +61,58 @@ def send_email(to: str, subject: str, text_body: str,
     Никогда не бросает исключение наружу — вызывающий код (обработчик входа)
     не должен падать из-за проблем почты.
     """
-    api_key = os.environ.get(API_KEY_ENV)
-    payload = {
-        "from": sender(),
-        "to": [to],
-        "subject": subject,
-        "text": text_body,
-    }
-    if html_body:
-        payload["html"] = html_body
+    user = os.environ.get("SMTP_USER")
+    password = os.environ.get("SMTP_PASS")
 
-    if not api_key:
+    if not user or not password:
         # стендовый режим: без внешнего трафика, факт — в аудит
         store.audit("mail.console", actor=to, success=True,
                     details={"subject": subject})
         print(f"[mailer:console] to={to} subject={subject!r}")
         return True
 
-    req = urllib.request.Request(
-        API_URL,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
+    host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+    use_ssl = os.environ.get("SMTP_SSL", "0") == "1"
+    port = int(os.environ.get("SMTP_PORT", "465" if use_ssl else "587"))
+    from_addr = sender() or user
+
+    msg = _build_message(from_addr, to, subject, text_body, html_body)
+
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT_SEC) as resp:
-            ok = 200 <= resp.status < 300
-        store.audit("mail.sent", actor=to, success=ok,
+        context = ssl.create_default_context()
+        if use_ssl:
+            with smtplib.SMTP_SSL(host, port, timeout=TIMEOUT_SEC,
+                                  context=context) as server:
+                server.login(user, password)
+                server.sendmail(from_addr, [to], msg.as_string())
+        else:
+            with smtplib.SMTP(host, port, timeout=TIMEOUT_SEC) as server:
+                server.ehlo()
+                server.starttls(context=context)
+                server.ehlo()
+                server.login(user, password)
+                server.sendmail(from_addr, [to], msg.as_string())
+        store.audit("mail.sent", actor=to, success=True,
                     details={"subject": subject})
-        return ok
-    except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError) as e:
+        return True
+    except Exception as e:  # noqa: BLE001 — почта не должна ронять вход
         store.audit("mail.failed", actor=to, success=False,
                     details={"subject": subject, "error": str(e)[:200]})
         return False
+
+
+def _build_message(from_addr: str, to: str, subject: str,
+                   text_body: str, html_body: str | None) -> MIMEMultipart:
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = Header(subject, "utf-8")
+    msg["From"] = formataddr((str(Header("OrgMFA", "utf-8")), from_addr))
+    msg["To"] = to
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid(domain="orgmfa.local")
+    msg.attach(MIMEText(text_body, "plain", "utf-8"))
+    if html_body:
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
+    return msg
 
 
 # ---------------------------------------------------------------------------

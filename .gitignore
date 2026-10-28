@@ -1,2 +1,7 @@
 __pycache__/
 *.pyc
+.env
+*.env
+.venv/
+mfa.db
+__pycache__/
