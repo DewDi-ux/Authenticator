@@ -957,4 +957,5 @@ async def startup() -> None:
     store.init_db()
     # демо-пользователь для защиты диссертационного показа
     if store.get_user_by_login("ivanov") is None:
-        store.create_user("ivanov", "Demo2026!passw0rd", "Иванов А. П.")
+        store.create_user("ivanov", "Demo2026!passw0rd", "Иванов А. П.",
+                          "ivanov@company.local")
