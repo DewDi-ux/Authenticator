@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
@@ -20,6 +21,19 @@ from fastapi.testclient import TestClient
 
 from app import risk, security, store
 from app.main import app
+
+
+@pytest.fixture(autouse=True)
+def _work_hours(monkeypatch):
+    """Фиксируем признак «рабочее время» для всего набора тестов.
+
+    Иначе verdict зависит от часового пояса и времени запуска pytest:
+    ночной прогон добавлял +8 баллов всем сценариям и штатный вход
+    начинал выглядеть «рискованным». Сами ветки нерабочего времени
+    проверяются точечно (monkeypatch на фиксированную метку времени).
+    """
+    monkeypatch.setattr(risk, "outside_work_hours", lambda now=None: False)
+    yield
 
 DB = Path(store.DB_PATH)
 
@@ -450,8 +464,8 @@ class TestIntegrationAPI:
     def _key(self, monkeypatch):
         monkeypatch.setenv("MFA_INTEGRATION_KEY", self.KEY)
 
-    def _hdr(self, **extra):
-        return {"X-Service-Key": self.KEY, **extra}
+    def _hdr(self, extra=None):
+        return {"X-Service-Key": self.KEY, **(extra or {})}
 
     def _enrolled_user(self, client):
         client.post("/register", data={
@@ -509,7 +523,7 @@ class TestIntegrationAPI:
         """ИС-контракт: на step_up TOTP+резервный код, расход одного кода,
         отсутствие цикла «TOTP->код->TOTP». Риск форсируется служебным заголовком."""
         seed, codes = self._enrolled_user(client)
-        r = client.post("/api/auth/login", headers=self._hdr(X-Force-Step-Up="1"),
+        r = client.post("/api/auth/login", headers=self._hdr({"X-Force-Step-Up": "1"}),
                         json={"login": "smith", "password": self.PASSWORD})
         d = r.json()
         assert d["stage"] == "step_up", d
