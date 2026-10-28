@@ -23,12 +23,12 @@ import base64
 import os
 import time
 
-from fastapi import FastAPI, Form, Request, Response
+from fastapi import BackgroundTasks, FastAPI, Form, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pathlib import Path
 
-from . import risk, security, store
+from . import mailer, risk, security, store
 
 SESSION_COOKIE = "mfa_session"
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
@@ -107,19 +107,150 @@ async def register_page(request: Request):
     return templates.TemplateResponse(request, "register.html", {"msg": ""})
 
 
+# --- восстановление пароля («Забыли пароль?») --------------------------------
+@app.get("/forgot-password", response_class=HTMLResponse)
+async def forgot_page(request: Request, msg: str = ""):
+    return templates.TemplateResponse(request, "forgot_password.html",
+                                      {"msg": msg})
+
+
+@app.post("/forgot-password", response_class=HTMLResponse)
+async def forgot_password(request: Request, background_tasks: BackgroundTasks,
+                          email: str = Form("")):
+    """Отправляет письмо со ссылкой смены пароля ТОЛЬКО если адрес привязан
+    к существующей учётной записи. Внешний ответ при этом одинаков в обоих
+    случаях — форма не работает оракулом существования почты."""
+    ip = client_ip(request)
+    email = email.strip().lower()
+    u = store.get_user_by_email(email) if security.valid_email(email) else None
+    if u is not None:
+        token = store.create_reset_token(u.id)
+        link = _reset_link(request, token)
+        background_tasks.add_task(_notify_password_reset, u.email, u.full_name, link)
+        store.audit("auth.reset_requested", actor=u.login, ip=ip,
+                    details={"via": "email"})
+    else:
+        store.audit("auth.reset_requested_unknown", actor=email or "-", ip=ip,
+                    success=False)
+    return templates.TemplateResponse(
+        request, "forgot_password.html",
+        {"msg": "Если этот адрес привязан к учётной записи, на него отправлено "
+                "письмо со ссылкой для смены пароля (ссылка одноразовая, "
+                f"действует {store.RESET_TTL_SEC // 60} минут)."})
+
+
+@app.get("/reset-password", response_class=HTMLResponse)
+async def reset_page(request: Request, token: str = "", error: str = ""):
+    ok = bool(token) and store.peek_reset_token(token)
+    if not ok:
+        return templates.TemplateResponse(
+            request, "reset_password.html",
+            {"token": "", "msg": error or "Ссылка недействительна или истекла. "
+                                          "Запросите восстановление ещё раз."},
+            status_code=400)
+    return templates.TemplateResponse(request, "reset_password.html",
+                                      {"token": token, "msg": ""})
+
+
+@app.post("/reset-password", response_class=HTMLResponse)
+async def reset_password(request: Request, token: str = Form(...),
+                         password: str = Form(...), password2: str = Form(...)):
+    """Смена пароля по одноразовому токену из письма.
+
+    Токен гасится ДО проверки сложности нового пароля — повторное использование
+    ссылки невозможно даже при ошибке валидации (защита от «зombie»-токенов).
+    Все активные сессии пользователя сбрасываются: старый пароль больше не
+    должен держать сеансы живыми.
+    """
+    ip = client_ip(request)
+    uid = store.consume_reset_token(token)
+    if not uid:
+        return templates.TemplateResponse(
+            request, "reset_password.html",
+            {"token": "", "msg": "Ссылка недействительна или уже использована. "
+                                 "Запросите восстановление заново."},
+            status_code=400)
+    u = store.get_user_by_id(uid)
+    if u is None:
+        return templates.TemplateResponse(
+            request, "reset_password.html",
+            {"token": "", "msg": "Учётная запись не найдена."}, status_code=400)
+    if password != password2:
+        return templates.TemplateResponse(
+            request, "reset_password.html",
+            {"token": "", "msg": "Пароли не совпадают. Запросите новую ссылку."},
+            status_code=400)
+    errors = security.check_password_policy(password, u.login)
+    if errors:
+        return templates.TemplateResponse(
+            request, "reset_password.html",
+            {"token": "", "msg": "Новый пароль не подходит: " + "; ".join(errors) +
+                       " Запросите новую ссылку."}, status_code=400)
+    u.pass_hash = security.hash_password(password)
+    u.failed_attempts = 0
+    u.locked_until = 0.0          # раз легитимный владелец сменил пароль — снимаем lockout
+    store.update_user(u)
+    store.drop_user_sessions(u.id)
+    store.audit("auth.password_reset_ok", actor=u.login, ip=ip)
+    return templates.TemplateResponse(
+        request, "login.html",
+        {"msg": "Пароль изменён. Войдите с новым паролем и подтвердите вход "
+                "TOTP-кодом."})
+
+
+# --------------------------------------------------------------------------- #
+# Почтовые уведомления (фоновые задачи — не тормозят ответ аутентификации)
+# --------------------------------------------------------------------------- #
+def _notify_failed_attempts(to: str, name: str, attempts: int, ip: str,
+                            locked: bool) -> None:
+    """Вызывается как background task после достижения порога неудач."""
+    note = ("Учётная запись автоматически заблокирована на "
+            f"{risk.LOCKOUT_SEC // 60} минут." if locked else
+            "Если это продолжится, учётная запись будет временно заблокирована.")
+    subject, text, html = mailer.mail_failed_attempts(to, name, attempts, ip, note)
+    mailer.send_email(to, subject, text, html)
+
+
+def _notify_password_reset(to: str, name: str, link: str) -> None:
+    subject, text, html = mailer.mail_password_reset(
+        to, name, link, store.RESET_TTL_SEC // 60)
+    mailer.send_email(to, subject, text, html)
+
+
+def _reset_link(request: Request, token: str) -> str:
+    base = os.environ.get("MFA_BASE_URL", "").rstrip("/") or str(request.base_url).rstrip("/")
+    return f"{base}/reset-password?token={token}"
+
+
 # --------------------------------------------------------------------------- #
 # Регистрация
 # --------------------------------------------------------------------------- #
 @app.post("/register", response_class=HTMLResponse)
 async def register(request: Request, login: str = Form(...),
                    full_name: str = Form(""), password: str = Form(...),
-                   password2: str = Form(...)):
+                   password2: str = Form(...), email: str = Form("")):
     ip = client_ip(request)
+    email = email.strip().lower()
     if password != password2:
         msg = "Пароли не совпадают."
         return templates.TemplateResponse(request, "register.html", {"msg": msg}, status_code=400)
+    if not security.valid_email(email):
+        return templates.TemplateResponse(
+            request, "register.html",
+            {"msg": "Укажите корректную электронную почту — на неё придут "
+                    "уведомления о входах и ссылка восстановления пароля."},
+            status_code=400)
+    if store.get_user_by_email(email) is not None:
+        # без раскрытия «занят чужой почтой» деталей для перебора:
+        # одинаково нейтральное сообщение
+        store.audit("user.register_failed", actor=login, ip=ip, success=False,
+                    details={"reason": "email_taken"})
+        return templates.TemplateResponse(
+            request, "register.html",
+            {"msg": "Не удалось создать учётную запись: проверьте логин и почту."},
+            status_code=400)
     try:
-        store.create_user(login.strip(), password, full_name.strip())
+        store.create_user(login.strip(), password, full_name.strip(), email)
     except ValueError as e:
         store.audit("user.register_failed", actor=login, ip=ip, success=False,
                     details={"reason": str(e)})
@@ -135,7 +266,8 @@ async def register(request: Request, login: str = Form(...),
 # ШАГ 1: пароль + оценка риска
 # --------------------------------------------------------------------------- #
 @app.post("/login", response_class=HTMLResponse)
-async def login(request: Request, login: str = Form(...), password: str = Form(...)):
+async def login(request: Request, background_tasks: BackgroundTasks,
+                login: str = Form(...), password: str = Form(...)):
     ip, agent = client_ip(request), ua(request)
 
     if risk.rate_limited(ip):
@@ -161,10 +293,19 @@ async def login(request: Request, login: str = Form(...), password: str = Form(.
 
     ok, needs_rehash = security.verify_password(password, u.pass_hash)
     if not ok:
+        was_locked_before = risk.is_locked(u)
         risk.apply_failed_attempt(u, ip)
         store.update_user(u)
         store.audit("auth.fail.password", actor=u.login, ip=ip, success=False,
                     details={"failed_total": u.failed_attempts})
+        # уведомление владельца почты: при достижении порога неудач и при
+        # срабатывании блокировки (письмо уходит фоново — ответ не тормозится)
+        if u.email and not was_locked_before and (
+                u.failed_attempts >= risk.NOTIFY_FAILED_AT or
+                (u.failed_attempts >= risk.MAX_FAILED and risk.is_locked(u))):
+            background_tasks.add_task(
+                _notify_failed_attempts, u.email, u.full_name,
+                u.failed_attempts, ip, risk.is_locked(u))
         return _login_error(request)
 
     # --- оценка риска ДО сброса счётчика неудачных попыток ---
@@ -567,12 +708,14 @@ def _require_service_key(request: Request) -> JSONResponse | None:
 
 
 @app.post("/api/auth/login")
-async def api_auth_login(request: Request):
+async def api_auth_login(request: Request, background_tasks: BackgroundTasks):
     """Шаг 1 для ИС: проверка пароля, оценка риска, создание stages-сессии.
 
     Вход: JSON {login, password}. Ответ: stage (mfa|step_up|setup), id сессии,
     TTL. При верном пароле сессия ещё НЕ авторизована — доступ к ИС выдаётся
     только после успешного /api/auth/totp (или /api/auth/recovery).
+    Серия неудачных попыток порождает почтовое уведомление владельца учётки
+    (фоновая задача, как в браузерном входе /login).
     """
     denied = _require_service_key(request)
     if denied:
@@ -601,10 +744,17 @@ async def api_auth_login(request: Request):
 
     ok, needs_rehash = security.verify_password(password, u.pass_hash)
     if not ok:
+        was_locked_before = risk.is_locked(u)
         risk.apply_failed_attempt(u, ip)
         store.update_user(u)
         store.audit("integration.auth.fail", actor=u.login, ip=ip, success=False,
                     details={"failed_total": u.failed_attempts})
+        if u.email and not was_locked_before and (
+                u.failed_attempts >= risk.NOTIFY_FAILED_AT or
+                (u.failed_attempts >= risk.MAX_FAILED and risk.is_locked(u))):
+            background_tasks.add_task(
+                _notify_failed_attempts, u.email, u.full_name,
+                u.failed_attempts, ip, risk.is_locked(u))
         return JSONResponse({"error": "invalid_credentials"}, 401)
 
     last_login_ts = _last_success_ts(u.id)

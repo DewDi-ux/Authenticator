@@ -121,6 +121,8 @@ def rate_limited(ip: str) -> bool:
 # Lockout policy: 5 неудачных попыток -> блокировка аккаунта на 15 минут
 MAX_FAILED = 5
 LOCKOUT_SEC = 900
+NOTIFY_FAILED_AT = 5   # порог почтового предупреждения владельца учётки
+                       # (OWASP ASVS V2.2.1: уведомление о серии неудач)
 
 
 def apply_failed_attempt(u, ip: str) -> None:

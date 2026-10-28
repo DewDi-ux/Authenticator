@@ -60,6 +60,12 @@ def init_db() -> None:
                 ts REAL, event TEXT, actor TEXT, ip TEXT,
                 success INTEGER, details TEXT
             );
+            CREATE TABLE IF NOT EXISTS password_resets(
+                token_hash TEXT PRIMARY KEY,   -- sha256(токен из письма), plaintext не храним
+                user_id TEXT NOT NULL,
+                created_at REAL, expires_at REAL,
+                used_at REAL                   -- NULL = токен ещё не погашен
+            );
             """
         )
         # мягкая миграция стендов с ранней схемой: добавить недостающие столбцы
@@ -67,6 +73,9 @@ def init_db() -> None:
         for col, decl in (("last_ua", "TEXT"), ("risk_score", "INTEGER DEFAULT 0")):
             if col not in cols:
                 c.execute(f"ALTER TABLE sessions ADD COLUMN {col} {decl}")
+        ucols = {r["name"] for r in c.execute("PRAGMA table_info(users)")}
+        if "email" not in ucols:
+            c.execute("ALTER TABLE users ADD COLUMN email TEXT")
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +90,7 @@ class User:
     mfa_enabled: bool
     failed_attempts: int
     locked_until: float
+    email: str = ""
 
     @staticmethod
     def from_row(r: sqlite3.Row) -> "User":
@@ -90,10 +100,12 @@ class User:
             recovery_hashes=json.loads(r["recovery_hashes"] or "[]"),
             mfa_enabled=bool(r["mfa_enabled"]),
             failed_attempts=r["failed_attempts"], locked_until=r["locked_until"],
+            email=(r["email"] if "email" in r.keys() else "") or "",
         )
 
 
-def create_user(login: str, password: str, full_name: str = "") -> User:
+def create_user(login: str, password: str, full_name: str = "",
+                email: str = "") -> User:
     errors = security.check_password_policy(password, login)
     if errors:
         raise ValueError("; ".join(errors))
@@ -104,9 +116,9 @@ def create_user(login: str, password: str, full_name: str = "") -> User:
         if cur.fetchone():
             raise ValueError("Логин уже занят.")
         c.execute(
-            "INSERT INTO users VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO users VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (uid, login, full_name, security.hash_password(password),
-             None, None, 0, 0, 0.0, now),
+             None, None, 0, 0, 0.0, now, email.strip().lower()),
         )
     audit("user.created", actor=login)
     return get_user_by_login(login)  # type: ignore[return-value]
@@ -118,14 +130,92 @@ def get_user_by_login(login: str) -> User | None:
     return User.from_row(r) if r else None
 
 
+def get_user_by_email(email: str) -> User | None:
+    """Поиск учётной записи по почте (для восстановления пароля)."""
+    email = (email or "").strip().lower()
+    if not email:
+        return None
+    with _conn() as c:
+        r = c.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+    return User.from_row(r) if r else None
+
+
+def get_user_by_id(user_id: str) -> User | None:
+    with _conn() as c:
+        r = c.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+    return User.from_row(r) if r else None
+
+
 def update_user(u: User) -> None:
     with _lock, _conn() as c:
         c.execute(
             "UPDATE users SET pass_hash=?, totp_enc=?, recovery_hashes=?,"
-            " mfa_enabled=?, failed_attempts=?, locked_until=? WHERE id=?",
+            " mfa_enabled=?, failed_attempts=?, locked_until=?, email=? WHERE id=?",
             (u.pass_hash, u.totp_enc, json.dumps(u.recovery_hashes),
-             int(u.mfa_enabled), u.failed_attempts, u.locked_until, u.id),
+             int(u.mfa_enabled), u.failed_attempts, u.locked_until,
+             (u.email or "").strip().lower(), u.id),
         )
+
+
+# ---------------------------------------------------------------------------
+# Токены восстановления пароля (одноразовые; в БД — только sha256 токена)
+# ---------------------------------------------------------------------------
+RESET_TTL_SEC = 15 * 60     # ссылка в письме живёт 15 минут
+
+
+def create_reset_token(user_id: str) -> str:
+    """Создаёт одноразовый токен сброса; возвращает PLAINTEXT токена
+    (только для ссылки в письме). В базе — хэш: утечка SQLite/дампа не
+    даёт готовых активных ссылок на смену пароля."""
+    import hashlib
+    import secrets as _secrets
+    token = _secrets.token_urlsafe(32)
+    th = hashlib.sha256(token.encode()).hexdigest()
+    now = time.time()
+    with _lock, _conn() as c:
+        c.execute("DELETE FROM password_resets WHERE expires_at < ?", (now,))
+        c.execute(
+            "INSERT INTO password_resets(token_hash, user_id, created_at,"
+            " expires_at, used_at) VALUES (?,?,?,?,NULL)",
+            (th, user_id, now, now + RESET_TTL_SEC))
+    return token
+
+
+def consume_reset_token(token: str) -> str | None:
+    """Валидирует и гасит токен (одноразовость). Возвращает user_id либо None."""
+    import hashlib
+    th = hashlib.sha256((token or "").encode()).hexdigest()
+    now = time.time()
+    with _lock, _conn() as c:
+        r = c.execute(
+            "SELECT user_id FROM password_resets WHERE token_hash=?"
+            " AND used_at IS NULL AND expires_at > ?", (th, now)).fetchone()
+        if not r:
+            return None
+        c.execute("UPDATE password_resets SET used_at=? WHERE token_hash=?",
+                  (now, th))
+    return r["user_id"]
+
+
+def peek_reset_token(token: str) -> bool:
+    """Проверяет действительность токена БЕЗ погашения — для GET-открытия
+    страницы смены пароля из письма. Само сжатие происходит в POST."""
+    import hashlib
+    th = hashlib.sha256((token or "").encode()).hexdigest()
+    now = time.time()
+    with _conn() as c:
+        r = c.execute(
+            "SELECT 1 FROM password_resets WHERE token_hash=?"
+            " AND used_at IS NULL AND expires_at > ?", (th, now)).fetchone()
+    return r is not None
+
+
+def drop_user_sessions(user_id: str) -> int:
+    """Сбрасывает все сессии пользователя (после смены пароля / перевыпуска
+    фактора). Возвращает число удалённых сессий."""
+    with _lock, _conn() as c:
+        cur = c.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+    return cur.rowcount or 0
 
 
 # ---------------------------------------------------------------------------
