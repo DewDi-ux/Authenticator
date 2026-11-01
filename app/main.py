@@ -28,7 +28,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pathlib import Path
 
-from . import mailer, risk, security, store
+from . import admin, mailer, risk, security, store
 
 SESSION_COOKIE = "mfa_session"
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
@@ -38,6 +38,10 @@ app = FastAPI(
     description="Практическая реализация ВКР: MFA для информационной системы организации.",
     version="1.0.0",
 )
+
+# Админ-консоль OrgMFA: все маршруты app/admin.py смонтированы под /admin.
+# Доступ к ним ограничен ролью admin и доверенными сетями (см. admin._gate).
+app.include_router(admin.router, prefix="/admin", tags=["admin"])
 
 # Фильтр шаблона: unix-время -> человекочитаемая дата для журнала
 templates.env.filters["timestamp_fmt"] = lambda ts: time.strftime(
@@ -955,7 +959,44 @@ async def api_auth_logout(request: Request):
 @app.on_event("startup")
 async def startup() -> None:
     store.init_db()
+    _bootstrap_admin()
     # демо-пользователь для защиты диссертационного показа
     if store.get_user_by_login("ivanov") is None:
         store.create_user("ivanov", "Demo2026!passw0rd", "Иванов А. П.",
                           "ivanov@company.local")
+
+
+def _bootstrap_admin() -> None:
+    """Создаёт первого администратора из переменных окружения MFA_ADMIN_*.
+
+    Политика OrgMFA (см. app/admin.py): self-promotion запрещён, поэтому роль
+    admin нельзя выдать ни через форму регистрации, ни через админ-консоль.
+    Единственный путь появления первого админа — bootstrap при старте сервиса:
+
+        MFA_ADMIN_LOGIN     логин (обязательно, иначе шаг пропускается)
+        MFA_ADMIN_PASSWORD  пароль   (обязательно)
+        MFA_ADMIN_EMAIL     e-mail   (опционально, нужен для алертов/восстановления)
+        MFA_ADMIN_NAME      ФИО      (опционально)
+
+    Функция идемпотентна: если учётка с таким логином уже существует — ничего
+    не меняется (перезапуск сервиса не сбрасывает пароль и права админа).
+    Созданная учётка имеет role='admin'; вход в /admin после этого требует
+    обычной двухфакторной процедуры (пароль + TOTP), привязать TOTP нужно
+    через личный кабинет при первом входе.
+    """
+    login = os.environ.get("MFA_ADMIN_LOGIN", "").strip().lower()
+    password = os.environ.get("MFA_ADMIN_PASSWORD", "")
+    if not login or not password:
+        return  # bootstrap не настроен — пропускаем (например, на тестовом стенде)
+    if store.get_user_by_login(login) is not None:
+        return  # уже существует — не трогаем (идемпотентность при рестарте)
+    try:
+        store.create_user(login, password,
+                          os.environ.get("MFA_ADMIN_NAME", ""),
+                          os.environ.get("MFA_ADMIN_EMAIL", "").strip().lower(),
+                          role="admin")
+        store.audit("admin.bootstrap.created", actor=login,
+                    details={"via": "env"})
+    except ValueError as e:
+        # слишком слабый пароль из окружения — не роняем сервис, но сигналим
+        print(f"[OrgMFA] bootstrap-администратор не создан: {e}")

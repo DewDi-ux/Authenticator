@@ -135,7 +135,10 @@ def create_user(login: str, password: str, full_name: str = "",
         if cur.fetchone():
             raise ValueError("Логин уже занят.")
         c.execute(
-            "INSERT INTO users VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO users (id, login, full_name, pass_hash, totp_enc,"
+            " recovery_hashes, mfa_enabled, failed_attempts, locked_until,"
+            " created_at, email, role, disabled)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (uid, login, full_name, security.hash_password(password),
              None, None, 0, 0, 0.0, now, email.strip().lower(),
              role, 0),
