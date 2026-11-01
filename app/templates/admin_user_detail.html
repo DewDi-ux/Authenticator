@@ -61,6 +61,12 @@
 const UID = "{{ t.id }}";
 async function act(action, data, okText) {
   const r = await adminPost(`/admin/users/${UID}/${action}`, new URLSearchParams(data));
+  // step-up истёк/не пройден: сервер отвечает JSON 401 reauth_required
+  // (для AJAX-запросов редирект на HTML больше не возвращается)
+  if (r.data && r.data.error === "reauth_required") {
+    showMsg(document.getElementById("msg"),
+            "Требуется повторный ввод пароля (step-up). Перенаправление…", "info");
+    location.href = r.data.reauth_url || `/admin/reauth?next=/admin/users/${UID}`; return; }
   if (r.status >= 300 && r.status < 400) {
     location.href = `/admin/reauth?next=/admin/users/${UID}`; return; }
   showMsg(document.getElementById("msg"),
@@ -76,6 +82,10 @@ async function resetFactor() {
   const reason = prompt("Основание сброса фактора (акт инцидента ИБ):") || "";
   if (prompt("Подтвердите сброс TOTP и перевыпуск резервных кодов (введите RESET):") !== "RESET") return;
   const r = await adminPost(`/admin/users/${UID}/reset-factor`, {reason, notify: "on"});
+  if (r.data && r.data.error === "reauth_required") {
+    showMsg(document.getElementById("msg"),
+            "Требуется повторный ввод пароля (step-up). Перенаправление…", "info");
+    location.href = r.data.reauth_url || `/admin/reauth?next=/admin/users/${UID}`; return; }
   if (r.status >= 300 && r.status < 400) {
     location.href = `/admin/reauth?next=/admin/users/${UID}`; return; }
   if (!r.data.ok) {
