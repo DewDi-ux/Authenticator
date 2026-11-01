@@ -200,14 +200,20 @@ def _require_stepup(request: Request) -> tuple[dict | None, store.User | None,
         next_url = "/admin"
     if u is None or not u.is_admin or u.disabled:
         return s, u, _reauth_denied(request, next_url)
-    if s["stage"] != "step_up":
+    # Stage «step_up» — это стадия ВХОДА (третий фактор при рискованном
+    # логине), а не разрешение на действие. Раньше здесь требовался
+    # s["stage"]=="step_up", из-за чего штатный authed-админ никогда не мог
+    # выполнить критическое действие: запрос уходил на reauth, а POST
+    # /admin/reauth ставил stage="step_up" с TTL 120 с — сессия умирала,
+    # админа выбрасывало на /admin/login, действие не выполнялось.
+    # Разрешение действия хранится отдельно: одноразовый grant (_stepup_grants).
+    if s["stage"] != "authed":
         return s, u, _reauth_denied(request, next_url)
     st = _stepup_state(s["token"])
     if st is None or time.time() - st.get("granted_at", 0) > ADMIN_STEPUP_TTL:
         # не убиваем сессию целиком (иначе админ терял бы и authed-доступ):
-        # просто снимаем grant и возвращаем в authed до повторного reauth
+        # просто снимаем протухший grant до повторного reauth
         _stepup_grants.pop(s["token"], None)
-        store.set_session_stage(s["token"], "authed", ttl=ADMIN_SESSION_TTL)
         return s, u, _reauth_denied(request, next_url)
     return s, u, None
 
@@ -442,9 +448,22 @@ async def reauth(request: Request, password: str = Form(...),
     # (например, /admin/users/<uid>/drop-sessions) дал бы 405 Method Not Allowed
     next = _safe_admin_next(_get_next_url(next.split("?")[0]))
     _grant_stepup(s["token"], action=next)
-    store.set_session_stage(s["token"], "step_up", ttl=ADMIN_STEPUP_TTL)
+    # ВАЖНО: разрешаем grant СВЕЖЕЙ authed-сессии. Раньше здесь ставился
+    # stage="step_up" с ttl=ADMIN_STEPUP_TTL (120 с): админская сессия
+    # умирала через 2 минуты после подтверждения пароля, и следующее
+    # действие (или возврат на страницу) выбрасывало админа на /admin/login,
+    # а цель (сессии сотрудника) оставалась нетронутой — grant умирал вместе
+    # с записью сессии в БД. Теперь stage остаётся "authed", шаг подтверждён
+    # отдельным одноразовым grant'ом с TTL ADMIN_STEPUP_TTL; сама сессия
+    # продлевается стандартным ADMIN_SESSION_TTL.
+    store.set_session_stage(s["token"], "authed", ttl=ADMIN_SESSION_TTL)
     store.audit("admin.stepup.ok", actor=u.login, ip=ip)
-    return RedirectResponse(next, status_code=303)
+    resp = RedirectResponse(next, status_code=303)
+    # cookie живёт дольше записи сессии — переставляем max_age актуальным
+    # ADMIN_SESSION_TTL, чтобы браузер не «забыл» токен раньше времени
+    resp.set_cookie("mfa_session", s["token"], httponly=True, samesite="lax",
+                    secure=False, max_age=int(ADMIN_SESSION_TTL), path="/")
+    return resp
 
 
 # ---------------------------------------------------------------------------
@@ -869,8 +888,13 @@ async def admin_logout(request: Request):
 
 # ---------------------------------------------------------------------------
 def _consume_stepup(token: str) -> None:
-    """Step-up одноразовый: после действия возвращаем сессию в authed."""
-    store.set_session_stage(token, "authed", ttl=ADMIN_SESSION_TTL)
+    """Step-up на действие одноразовый: гасим grant; сессия остаётся authed.
+
+    Не меняем stage/TTL сессии: раньше здесь вызывался
+    set_session_stage(..., ttl=ADMIN_SESSION_TTL), что для админа, вошедшего
+    через обычный вход (cookie max_age 8 ч), укорачивало запись сессии до 2 ч
+    и позже «тихо» выбрасывало его на /admin/login."""
+    _stepup_grants.pop(token, None)
     risk.clear_step_up(token)
 
 
