@@ -110,11 +110,42 @@ def _wants_json(request: Request) -> bool:
     return "application/json" in accept
 
 
+def _safe_admin_next(url: str) -> str:
+    """Разрешаем редирект только на внутренние /admin GET-страницы."""
+    if not url or not url.startswith("/admin") or url.startswith("//"):
+        return "/admin"
+    return url
+
+
+def _get_next_url(path: str) -> str:
+    """GET-адрес страницы для POST-маршрута действия.
+
+    Страницы reauth/redirect должны указывать на HTML-представление (GET),
+    а не на сам POST-эндпоинт: браузер откроет next методом GET и получил бы
+    405 Method Not Allowed.
+    """
+    parts = [p for p in path.split("/") if p]  # ['admin','users','<uid>','disable',...]
+    if len(parts) >= 3 and parts[0] == "admin" and parts[1] == "users":
+        uid = parts[2]
+        if len(parts) >= 4:          # действие над пользователем -> карточка
+            return f"/admin/users/{uid}"
+        if uid != "create":           # /admin/users или карточка -> список
+            return "/admin/users"
+    if len(parts) >= 2 and parts[0] == "admin" and parts[1] == "policy":
+        return "/admin/policy"
+    return "/admin"
+
+
 def _reauth_denied(request: Request, next_url: str = "/admin",
                    login_url: str = "/admin/login") -> Response:
     """Отказ по step-up: для AJAX — JSON 401 reauth_required (иначе fetch
     молча следует редиректу на HTML-страницу reauth и падает на разборе
-    HTML как JSON — «bad_response»); для форм — обычный 303."""
+    HTML как JSON — «bad_response»); для форм — обычный 303.
+
+    next_url всегда GET-страница: после подтверждения пароля редирект на
+    POST-эндпоинт вызвал бы 405 Method Not Allowed.
+    """
+    next_url = _safe_admin_next(_get_next_url(next_url))
     if _wants_json(request):
         return JSONResponse(
             {"ok": False, "error": "reauth_required",
@@ -128,8 +159,9 @@ def _require_stepup(request: Request) -> tuple[dict | None, store.User | None,
                                                Response | None]:
     """Для критических действий: stage=='step_up' + свежий timestamp.
 
-    URL действия используется как next для страницы reauth — после повторного
-    ввода пароля админ возвращается туда, где выполнял действие.
+    После повторного ввода пароля админ возвращается на GET-страницу,
+    откуда выполнял действие (карточка пользователя / список), и повторяет
+    его со свежим grant (TTL ADMIN_STEPUP_TTL).
     """
     s, u = _current(request)
     next_url = request.url.path or "/admin"
@@ -375,8 +407,9 @@ async def reauth(request: Request, password: str = Form(...),
                     details={"reason": "bad_password"})
         return _page(request, "admin_reauth.html",
                      {"next": next, "msg": "Неверный пароль."}, status=403)
-    if not next.startswith("/admin"):
-        next = "/admin"
+    # next должен вести на GET-страницу: редирект 303 на POST-эндпоинт
+    # (например, /admin/users/<uid>/drop-sessions) дал бы 405 Method Not Allowed
+    next = _safe_admin_next(_get_next_url(next.split("?")[0]))
     _grant_stepup(s["token"], action=next)
     store.set_session_stage(s["token"], "step_up", ttl=ADMIN_STEPUP_TTL)
     store.audit("admin.stepup.ok", actor=u.login, ip=ip)
