@@ -38,9 +38,10 @@
   <h2>Активные сессии</h2>
   {% if sessions %}
   <table class="grid">
-    <tr><th>Стадия</th><th>IP</th><th>User-Agent</th><th>Создана</th><th>Истекает</th></tr>
+    <tr><th>Стадия</th><th>IP</th><th>Браузер / ОС</th><th>User-Agent</th><th>Создана</th><th>Истекает</th></tr>
     {% for s in sessions %}
-    <tr><td>{{ s.stage }}</td><td>{{ s.ip }}</td><td>{{ s.user_agent[:60] }}</td>
+    <tr><td>{{ s.stage }}</td><td>{{ s.ip }}</td><td>{{ s.browser }} · {{ s.os }}</td>
+        <td title="{{ s.user_agent or '' }}">{{ (s.user_agent or "")[:60] }}{{ '…' if (s.user_agent or '')|length > 60 else '' }}</td>
         <td>{{ s.created_at|timestamp_fmt }}</td><td>{{ s.expires_at|timestamp_fmt }}</td></tr>
     {% endfor %}
   </table>

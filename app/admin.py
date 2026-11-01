@@ -32,7 +32,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from fastapi.templating import Jinja2Templates
 from pathlib import Path
 
-from . import mailer, risk, security, store
+from . import mailer, risk, security, store, uaparse
 
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
@@ -257,10 +257,11 @@ async def admin_mfa_page(request: Request):
 
 
 @router.post("/mfa")
-async def admin_mfa_verify(request: Request, code: str = Form(...)):
+async def admin_mfa_verify(request: Request, code: str = Form(...),
+                           recovery_code: str = Form("")):
     s, u = _current(request)
     ip = _ip(request)
-    if not s or s["stage"] != "mfa" or u is None or u.totp_enc is None:
+    if not s or s["stage"] not in ("mfa", "step_up") or u is None or u.totp_enc is None:
         return JSONResponse({"error": "Сессия не найдена. Начните вход заново."}, 401)
     code = code.replace(" ", "")
     if risk.code_already_used(u.id, code):
@@ -275,9 +276,42 @@ async def admin_mfa_verify(request: Request, code: str = Form(...)):
     risk.remember_code(u.id, code)
     u.failed_attempts = 0
     store.update_user(u)
+
+    # --- стадия step_up (высокий риск админ-входа): после TOTP требуется
+    # третий фактор — ОДИН резервный код. Вход НЕ завершается без него. ---
+    if s["stage"] == "step_up":
+        rc = recovery_code.strip()
+        if rc:
+            h = security.hash_recovery_code(rc)
+            if u.recovery_hashes and any(
+                    security.constant_time_eq(h, stored)
+                    for stored in u.recovery_hashes):
+                u.recovery_hashes.remove(h)      # одноразовость
+                store.update_user(u)
+            else:
+                store.audit("admin.fail.recovery", actor=u.login, ip=ip,
+                            success=False)
+                return JSONResponse({"ok": False, "step_up": True,
+                                     "error": "Неверный резервный код."}, 401)
+        if not risk.recovery_step_done(s["token"]):
+            risk.mark_recovery_step_done(s["token"])
+            store.audit("admin.step_up.recovery_ok", actor=u.login, ip=ip,
+                        details={"remaining": len(u.recovery_hashes)})
+            return JSONResponse({
+                "ok": False, "step_up": True,
+                "message": "Резервный код принят. Введите текущий TOTP-код "
+                           "для завершения входа в админ-консоль."})
+        # оба фактора пройдены — ниже завершаем вход (authed)
+
     store.set_session_stage(s["token"], "authed", ttl=ADMIN_SESSION_TTL)
+    # Политика «одна активная сессия»: прочие сессии администратора
+    # завершаются только сейчас — после полного успешного входа
+    # (пароль + TOTP и, при стадии step_up, резервный код).
+    dropped = store.drop_other_sessions(u.id, s["token"])
+    factors = ["password", "totp"] + (["recovery"] if s["stage"] == "step_up" else [])
     store.audit("admin.login.success", actor=u.login, ip=ip,
-                details={"factors": ["password", "totp"]})
+                details={"factors": factors,
+                         "other_sessions_terminated": dropped})
     # алерт policy: подозрительный вход администратора (score выше порога)
     if s.get("risk_score", 0) >= ADMIN_RISK_THRESHOLD:
         store.audit("admin.alert.risky_login", actor=u.login, ip=ip,
@@ -382,6 +416,9 @@ async def user_detail(request: Request, uid: str):
                                              "message": "user id не найден"}, 404)
     events = store.audit_query(actor=target.login, limit=50)
     sess = store.user_sessions(target.id)
+    for r in sess:
+        r["browser"] = uaparse.parse_browser(r.get("user_agent"))
+        r["os"] = uaparse.parse_os(r.get("user_agent"))
     return _page(request, "admin_user_detail.html", {
         "me": u, "t": target, "events": events, "sessions": sess,
         "risk": risk, "now": time.time()})
@@ -635,6 +672,12 @@ async def sessions_page(request: Request):
     if deny:
         return deny
     rows = store.user_sessions()
+    # UA-строки разных Chromium-браузеров совпадают в начале — в UI выводим
+    # отдельно распознанные браузер/ОС (полная строка — по наведению).
+    # Важно: User-Agent подделывается, это отображение, а не идентификатор.
+    for r in rows:
+        r["browser"] = uaparse.parse_browser(r.get("user_agent"))
+        r["os"] = uaparse.parse_os(r.get("user_agent"))
     return _page(request, "admin_sessions.html", {"me": u, "rows": rows,
                                                   "now": time.time()})
 

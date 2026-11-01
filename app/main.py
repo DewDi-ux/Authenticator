@@ -478,9 +478,14 @@ async def verify_totp(request: Request, code: str = Form(...)):
         if risk.recovery_step_done(s["token"]):
             store.set_session_stage(s["token"], "authed")
             risk.clear_step_up(s["token"])
+            # Политика «одна активная сессия на пользователя»: все прочие
+            # сессии завершаются только сейчас — после прохождения ВСЕХ
+            # требуемых факторов (пароль + TOTP + резервный код).
+            dropped = store.drop_other_sessions(u.id, s["token"])
             store.audit("auth.success", actor=u.login, ip=ip,
                         details={"factors": ["password", "recovery", "totp"],
-                                 "step_up": True})
+                                 "step_up": True,
+                                 "other_sessions_terminated": dropped})
             return JSONResponse({"ok": True, "redirect": "/"})
         store.audit("auth.step_up.totp_ok", actor=u.login, ip=ip,
                     details={"reason": "risk-based step-up"})
@@ -489,8 +494,12 @@ async def verify_totp(request: Request, code: str = Form(...)):
                                         "Для завершения входа введите один резервный код."})
 
     store.set_session_stage(s["token"], "authed")
+    # Одна активная сессия на пользователя: прочие сессии (в т.ч. из других
+    # браузеров) завершаются только после полного успешного входа.
+    dropped = store.drop_other_sessions(u.id, s["token"])
     store.audit("auth.success", actor=u.login, ip=ip,
-                details={"factors": ["password", "totp"]})
+                details={"factors": ["password", "totp"],
+                         "other_sessions_terminated": dropped})
     return JSONResponse({"ok": True, "redirect": "/"})
 
 
@@ -524,10 +533,14 @@ async def verify_recovery(request: Request, code: str = Form(...)):
             if risk.totp_step_done(s["token"]):
                 store.set_session_stage(s["token"], "authed")
                 risk.clear_step_up(s["token"])
+                # Полный вход пройден (пароль + TOTP + резервный код) —
+                # завершаем прочие сессии учётки (политика одной сессии).
+                dropped = store.drop_other_sessions(u.id, s["token"])
                 store.audit("auth.success", actor=u.login, ip=ip,
                             details={"factors": ["password", "totp", "recovery"],
                                      "step_up": True,
-                                     "remaining": len(u.recovery_hashes)})
+                                     "remaining": len(u.recovery_hashes),
+                                     "other_sessions_terminated": dropped})
                 return JSONResponse({"ok": True, "redirect": "/",
                                      "warning": f"Вход выполнен. Резервных кодов осталось: "
                                                 f"{len(u.recovery_hashes)}."})
@@ -540,7 +553,11 @@ async def verify_recovery(request: Request, code: str = Form(...)):
                            "из приложения для завершения входа.",
                 "warning": f"Резервных кодов осталось: {len(u.recovery_hashes)}."})
         store.set_session_stage(s["token"], "authed")
-        store.audit("auth.success_recovery", actor=u.login, ip=ip)
+        # Полный вход завершён резервным кодом (потеря телефона) — одна
+        # активная сессия: прочие сессии учётки завершаются.
+        dropped = store.drop_other_sessions(u.id, s["token"])
+        store.audit("auth.success_recovery", actor=u.login, ip=ip,
+                    details={"other_sessions_terminated": dropped})
         return JSONResponse({"ok": True, "redirect": "/",
                              "warning": "Резервный код израсходован. Привяжите новый устройство."})
     store.audit("auth.fail.recovery", actor=u.login, ip=ip, success=False)
@@ -863,9 +880,13 @@ async def api_auth_totp(request: Request):
         if risk.recovery_step_done(tok):
             store.set_session_stage(tok, "authed")
             risk.clear_step_up(tok)
+            # Политика одной активной сессии: прочие сессии учётки
+            # завершаются только после полного успешного входа.
+            dropped = store.drop_other_sessions(u.id, tok)
             store.audit("integration.auth.success", actor=u.login, ip=ip,
                         details={"factors": ["password", "recovery", "totp"],
-                                 "step_up": True})
+                                 "step_up": True,
+                                 "other_sessions_terminated": dropped})
             return JSONResponse({"ok": True, "result": "granted",
                                  "subject": u.login, "session": tok,
                                  "ttl": store.AUTHED_TTL})
@@ -874,8 +895,10 @@ async def api_auth_totp(request: Request):
                              "message": "Требуется подтверждение одним резервным кодом."})
 
     store.set_session_stage(tok, "authed")
+    dropped = store.drop_other_sessions(u.id, tok)
     store.audit("integration.auth.success", actor=u.login, ip=ip,
-                details={"factors": ["password", "totp"]})
+                details={"factors": ["password", "totp"],
+                         "other_sessions_terminated": dropped})
     return JSONResponse({"ok": True, "result": "granted",
                          "subject": u.login, "session": tok,
                          "ttl": store.AUTHED_TTL})
@@ -923,9 +946,11 @@ async def api_auth_recovery(request: Request):
         if risk.totp_step_done(tok):
             store.set_session_stage(tok, "authed")
             risk.clear_step_up(tok)
+            dropped = store.drop_other_sessions(u.id, tok)
             store.audit("integration.auth.success", actor=u.login, ip=ip,
                         details={"factors": ["password", "totp", "recovery"],
-                                 "step_up": True})
+                                 "step_up": True,
+                                 "other_sessions_terminated": dropped})
             return JSONResponse({"ok": True, "result": "granted", "subject": u.login,
                                  "session": tok, "ttl": store.AUTHED_TTL,
                                  "remaining_recovery_codes": len(u.recovery_hashes)})
@@ -936,8 +961,10 @@ async def api_auth_recovery(request: Request):
                              "remaining_recovery_codes": len(u.recovery_hashes)})
 
     store.set_session_stage(tok, "authed")
+    dropped = store.drop_other_sessions(u.id, tok)
     store.audit("integration.auth.success_recovery", actor=u.login, ip=ip,
-                details={"remaining": len(u.recovery_hashes)})
+                details={"remaining": len(u.recovery_hashes),
+                         "other_sessions_terminated": dropped})
     return JSONResponse({"ok": True, "result": "granted", "subject": u.login,
                          "session": tok, "ttl": store.AUTHED_TTL,
                          "remaining_recovery_codes": len(u.recovery_hashes)})
