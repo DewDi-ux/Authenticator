@@ -78,8 +78,13 @@ def _gate(request: Request) -> tuple[dict | None, store.User | None,
     """Единая проверка доступа к /admin/*. Возвращает (session, user, deny)."""
     s, u = _current(request)
     ip = _ip(request)
+    if s is None:
+        # Сессии нет (истекла/сброшена). Для админ-зоны логичнее вернуть на
+        # /admin/login, а не на общий вход — раньше этот редирект и выглядел
+        # как «выбросило из админки при действии над другим сотрудником».
+        return s, u, RedirectResponse("/admin/login", status_code=303)
     if u is None or u.disabled:
-        return s, u, RedirectResponse("/login", status_code=303)
+        return s, u, RedirectResponse("/admin/login", status_code=303)
     if not u.is_admin:
         store.audit("admin.denied.not_admin", actor=u.login, ip=ip, success=False)
         return s, u, _page(request, "error.html", {
@@ -100,7 +105,7 @@ def _gate(request: Request) -> tuple[dict | None, store.User | None,
             " двухфакторного входа. Привяжите TOTP в личном кабинете."},
             status=403)
     if s["stage"] != "authed":
-        return s, u, RedirectResponse("/login", status_code=303)
+        return s, u, RedirectResponse("/admin/login", status_code=303)
     return s, u, None
 
 
@@ -144,7 +149,19 @@ def _reauth_denied(request: Request, next_url: str = "/admin",
 
     next_url всегда GET-страница: после подтверждения пароля редирект на
     POST-эндпоинт вызвал бы 405 Method Not Allowed.
+
+    Если админская сессия уже истекла (cookie есть, записи нет/протухла),
+    возвращаем не reauth, а session_expired: глупо предлагать повторный
+    пароль от несуществующей сессии — UI пошлёт на /admin/login.
     """
+    if _current(request)[0] is None:
+        if _wants_json(request):
+            return JSONResponse(
+                {"ok": False, "error": "session_expired",
+                 "message": "Административная сессия истекла. Войдите заново.",
+                 "login_url": login_url},
+                status_code=401)
+        return RedirectResponse(login_url, status_code=303)
     next_url = _safe_admin_next(_get_next_url(next_url))
     if _wants_json(request):
         return JSONResponse(
@@ -153,6 +170,20 @@ def _reauth_denied(request: Request, next_url: str = "/admin",
              "reauth_url": f"/admin/reauth?next={next_url}"},
             status_code=401)
     return RedirectResponse(login_url, status_code=303)
+
+
+def _drop_target_sessions(t: store.User, actor_token: str) -> int:
+    """Сброс сессий ЦЕЛЕВОЙ учётки t, но ВСЕГДА с сохранением текущей
+    сессии администратора (actor_token).
+
+    Токен админа уникален, поэтому даже при совпадении uid (админ действует
+    над собственной учёткой) его собственная сессия не удаляется: раньше
+    «Сбросить сессии» / деактивация / сброс фактора убивали и админскую
+    сессию — браузер получал 303 на страницу, _gate не находил сессию и
+    выбрасывал админа в общий вход (/login), что выглядело как «меня
+    разлогинило при действии над другим сотрудником».
+    """
+    return store.drop_other_sessions(t.id, keep_token=actor_token)
 
 
 def _require_stepup(request: Request) -> tuple[dict | None, store.User | None,
@@ -522,7 +553,7 @@ async def disable_user(request: Request, uid: str, confirm: str = Form("")):
         return JSONResponse({"error": "last_admin"}, 400)
     t.disabled = True
     store.update_user(t)
-    n = store.drop_user_sessions(t.id)
+    n = _drop_target_sessions(t, s["token"])
     store.audit("admin.user.disabled", actor=u.login, ip=_ip(request),
                 details={"target": t.login, "sessions_dropped": n})
     _consume_stepup(s["token"])
@@ -554,7 +585,7 @@ async def drop_sessions(request: Request, uid: str):
     t = store.get_user_by_id(uid)
     if t is None:
         return JSONResponse({"error": "not_found"}, 404)
-    n = store.drop_user_sessions(t.id)
+    n = _drop_target_sessions(t, s["token"])
     store.audit("admin.sessions.dropped", actor=u.login, ip=_ip(request),
                 details={"target": t.login, "count": n})
     _consume_stepup(s["token"])
@@ -586,7 +617,7 @@ async def reset_factor(request: Request, uid: str, reason: str = Form(""),
     t.recovery_hashes = [security.hash_recovery_code(c) for c in codes]
     t.mfa_enabled = False     # включится после подтверждения новым кодом
     store.update_user(t)
-    store.drop_user_sessions(t.id)
+    _drop_target_sessions(t, s["token"])
     uri = security.totp_provisioning_uri(seed, t.login)
     qr = security.qr_png_data_uri(uri)
     link = f"{qr}"
@@ -614,7 +645,7 @@ async def force_relogin(request: Request, uid: str):
     t = store.get_user_by_id(uid)
     if t is None:
         return JSONResponse({"error": "not_found"}, 404)
-    n = store.drop_user_sessions(t.id)
+    n = _drop_target_sessions(t, s["token"])
     store.audit("admin.user.force_relogin", actor=u.login, ip=_ip(request),
                 details={"target": t.login, "sessions_dropped": n})
     _consume_stepup(s["token"])
@@ -682,7 +713,8 @@ async def change_role(request: Request, uid: str, role: str = Form("user")):
         return JSONResponse({"error": "last_admin"}, 400)
     t.role = role
     store.update_user(t)
-    store.drop_user_sessions(t.id)   # роль сменилась — старые сессии невалидны
+    # роль сменилась — старые сессии невалидны, но сессия самого админа сохраняется
+    _drop_target_sessions(t, s["token"])
     store.audit("admin.role.changed", actor=u.login, ip=_ip(request),
                 details={"target": t.login, "to": role})
     _consume_stepup(s["token"])

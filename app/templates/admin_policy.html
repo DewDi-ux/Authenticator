@@ -40,6 +40,10 @@ document.getElementById("policy-form").addEventListener("submit", async ev => {
     showMsg(document.getElementById("msg"),
             "Требуется повторный ввод пароля (step-up). Перенаправление…", "info");
     location.href = r.data.reauth_url || "/admin/reauth?next=/admin/policy"; return; }
+  if (r.data && r.data.error === "session_expired") {
+    showMsg(document.getElementById("msg"),
+            r.data.message || "Сессия истекла. Перенаправление на вход…", "err");
+    location.href = r.data.login_url || "/admin/login"; return; }
   if (r.status >= 300 && r.status < 400) {
     location.href = "/admin/reauth?next=/admin/policy"; return; }
   showMsg(document.getElementById("msg"),

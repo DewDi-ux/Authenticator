@@ -67,6 +67,11 @@ async function act(action, data, okText) {
     showMsg(document.getElementById("msg"),
             "Требуется повторный ввод пароля (step-up). Перенаправление…", "info");
     location.href = r.data.reauth_url || `/admin/reauth?next=/admin/users/${UID}`; return; }
+  // админская сессия истекла — на reauth идти бессмысленно, только заново войти
+  if (r.data && r.data.error === "session_expired") {
+    showMsg(document.getElementById("msg"),
+            r.data.message || "Сессия истекла. Перенаправление на вход…", "err");
+    location.href = r.data.login_url || "/admin/login"; return; }
   if (r.status >= 300 && r.status < 400) {
     location.href = `/admin/reauth?next=/admin/users/${UID}`; return; }
   showMsg(document.getElementById("msg"),
@@ -86,6 +91,10 @@ async function resetFactor() {
     showMsg(document.getElementById("msg"),
             "Требуется повторный ввод пароля (step-up). Перенаправление…", "info");
     location.href = r.data.reauth_url || `/admin/reauth?next=/admin/users/${UID}`; return; }
+  if (r.data && r.data.error === "session_expired") {
+    showMsg(document.getElementById("msg"),
+            r.data.message || "Сессия истекла. Перенаправление на вход…", "err");
+    location.href = r.data.login_url || "/admin/login"; return; }
   if (r.status >= 300 && r.status < 400) {
     location.href = `/admin/reauth?next=/admin/users/${UID}`; return; }
   if (!r.data.ok) {
