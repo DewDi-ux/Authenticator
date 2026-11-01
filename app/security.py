@@ -181,8 +181,16 @@ def generate_recovery_codes(count: int = RECOVERY_CODE_COUNT) -> list[str]:
     # Алфавит без неоднозначных символов (O/0, I/1/l), код в верхнем регистре —
     # удобно переписывать с бумаги; энтропия ~2^40 на код (secrets, CSPRNG).
     alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-    return ["".join(secrets.choice(alphabet) for _ in range(2 * RECOVERY_CODE_BYTES))
+    return ["-".join(("".join(secrets.choice(alphabet)
+                              for _ in range(2 * RECOVERY_CODE_BYTES)))[i:i + 5]
+                     for i in (0, 5))
             for _ in range(count)]
+
+
+def format_recovery_code(code: str) -> str:
+    """Каноничный вывод кода XXXXX-XXXXX для UI (нормализация это сохраняет)."""
+    c = normalize_recovery_code(code)
+    return f"{c[:5]}-{c[5:]}" if len(c) == 10 else c
 
 
 def hash_recovery_code(code: str) -> str:

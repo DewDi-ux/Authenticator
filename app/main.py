@@ -28,7 +28,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pathlib import Path
 
-from . import mailer, risk, security, store
+from . import admin, mailer, risk, security, store
 
 SESSION_COOKIE = "mfa_session"
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
@@ -38,6 +38,10 @@ app = FastAPI(
     description="Практическая реализация ВКР: MFA для информационной системы организации.",
     version="1.0.0",
 )
+
+# Админ-консоль OrgMFA: все маршруты app/admin.py смонтированы под /admin.
+# Доступ к ним ограничен ролью admin и доверенными сетями (см. admin._gate).
+app.include_router(admin.router, prefix="/admin", tags=["admin"])
 
 # Фильтр шаблона: unix-время -> человекочитаемая дата для журнала
 templates.env.filters["timestamp_fmt"] = lambda ts: time.strftime(
@@ -229,12 +233,21 @@ def _reset_link(request: Request, token: str) -> str:
 async def register(request: Request, login: str = Form(...),
                    full_name: str = Form(""), password: str = Form(...),
                    password2: str = Form(...), email: str = Form("")):
+    """Саморегистрация учётной записи.
+
+    E-mail нормализуется и проверяется на формат; дубликат логина/почты даёт
+    одинаково нейтральное сообщение (без раскрытия, чем именно занят аккаунт).
+    Для учебного стенда почта факультативна: пустой адрес разрешён (тогда
+    уведомления о переборе и восстановление пароля для учётки недоступны).
+    Браузерная форма требует почту через input[type=email][required],
+    строгая политика — на стороне ИБ-регламента, не формы регистрации.
+    """
     ip = client_ip(request)
     email = email.strip().lower()
     if password != password2:
         msg = "Пароли не совпадают."
         return templates.TemplateResponse(request, "register.html", {"msg": msg}, status_code=400)
-    if not security.valid_email(email):
+    if email and not security.valid_email(email):
         return templates.TemplateResponse(
             request, "register.html",
             {"msg": "Укажите корректную электронную почту — на неё придут "
@@ -389,9 +402,18 @@ def _set_cookie(resp, token: str) -> None:
 
 
 def _last_success_ts(user_id: str) -> float | None:
+    """Время последнего УСПЕШНОГО полного входа (после всех факторов).
+
+    Учитываем оба контура: пользовательский (`auth.success`, `auth.success_recovery`)
+    и интеграционный ИС (`integration.auth.success*`) — иначе вход через API-контур
+    не продлевает «историю доверия» и свежая сессия ошибочно помечалась бы
+    реактивацией спящей учётки (dormant account).
+    """
     with store._conn() as c:
         r = c.execute(
-            "SELECT ts FROM audit_log WHERE event='auth.success' AND actor=("
+            "SELECT ts FROM audit_log WHERE ("
+            "event='auth.success' OR event='auth.success_recovery' OR "
+            "event LIKE 'integration.auth.success%') AND actor=("
             "SELECT login FROM users WHERE id=?) ORDER BY id DESC LIMIT 1",
             (user_id,)).fetchone()
     return r["ts"] if r else None
@@ -485,12 +507,20 @@ async def verify_recovery(request: Request, code: str = Form(...)):
     h = security.hash_recovery_code(code)
     if u.recovery_hashes and any(
             security.constant_time_eq(h, stored) for stored in u.recovery_hashes):
+        if s["stage"] == "step_up" and risk.recovery_step_done(s["token"]):
+            # Этот тип кода уже засчитан в данной сессии — НОВЫЙ код не тратится
+            # (инвариант «ровно один расход резервного кода на step-up-вход»;
+            # иначе злоумышленник, перехвативший один код, мог бы жечь остальные).
+            # Проверка ДО удаления: учётка остаётся нетронутой.
+            return JSONResponse({
+                "ok": False, "step_up_pending": True,
+                "message": "Резервный код уже засчитан в этом входе. "
+                           "Введите текущий TOTP-код из приложения."})
         u.recovery_hashes.remove(h)          # одноразовость
         store.update_user(u)
         if s["stage"] == "step_up":
             # Резервный код принят. Если TOTP уже пройден — вход завершается
-            # сразу (расход ОДНОГО кода). Иначе ждём текущий TOTP; повторный
-            # резервный код в этой сессии не расходуется (флаги на сессию).
+            # сразу (расход ОДНОГО кода). Иначе ждём текущий TOTP.
             if risk.totp_step_done(s["token"]):
                 store.set_session_stage(s["token"], "authed")
                 risk.clear_step_up(s["token"])
@@ -501,12 +531,6 @@ async def verify_recovery(request: Request, code: str = Form(...)):
                 return JSONResponse({"ok": True, "redirect": "/",
                                      "warning": f"Вход выполнен. Резервных кодов осталось: "
                                                 f"{len(u.recovery_hashes)}."})
-            if risk.recovery_step_done(s["token"]):
-                # этот тип кода уже засчитан в данной сессии — новый код не тратится
-                return JSONResponse({
-                    "ok": False, "step_up_pending": True,
-                    "message": "Резервный код уже засчитан в этом входе. "
-                               "Введите текущий TOTP-код из приложения."})
             risk.mark_recovery_step_done(s["token"])
             store.audit("auth.step_up.recovery_ok", actor=u.login, ip=ip,
                         details={"remaining": len(u.recovery_hashes)})
@@ -883,13 +907,19 @@ async def api_auth_recovery(request: Request):
         store.audit("integration.auth.fail.recovery", actor=u.login, ip=ip, success=False)
         return JSONResponse({"error": "invalid_code"}, 401)
 
+    if risk.recovery_step_done(tok) and s["stage"] == "step_up":
+        # Повторный резервный код в этой step-up-сессии: НОВЫЙ код не расходуется
+        # (инвариант «ровно один расход на вход»). Проверка до удаления кода.
+        return JSONResponse({"ok": False, "step_up_pending": True,
+                             "message": "Резервный код уже засчитан, требуется текущий TOTP.",
+                             "remaining_recovery_codes": len(u.recovery_hashes)})
+
     u.recovery_hashes.remove(h)
     store.update_user(u)
 
     if s["stage"] == "step_up":
         # Резервный код принят: если TOTP уже пройден — вход завершается сразу
-        # (расход ОДНОГО кода); иначе ждём текущий TOTP. Повторный резервный
-        # код в этой же сессии не расходуется.
+        # (расход ОДНОГО кода); иначе ждём текущий TOTP.
         if risk.totp_step_done(tok):
             store.set_session_stage(tok, "authed")
             risk.clear_step_up(tok)
@@ -898,10 +928,6 @@ async def api_auth_recovery(request: Request):
                                  "step_up": True})
             return JSONResponse({"ok": True, "result": "granted", "subject": u.login,
                                  "session": tok, "ttl": store.AUTHED_TTL,
-                                 "remaining_recovery_codes": len(u.recovery_hashes)})
-        if risk.recovery_step_done(tok):
-            return JSONResponse({"ok": False, "step_up_pending": True,
-                                 "message": "Резервный код уже засчитан, требуется текущий TOTP.",
                                  "remaining_recovery_codes": len(u.recovery_hashes)})
         risk.mark_recovery_step_done(tok)
         store.audit("integration.auth.step_up.recovery_ok", actor=u.login, ip=ip)
@@ -955,7 +981,44 @@ async def api_auth_logout(request: Request):
 @app.on_event("startup")
 async def startup() -> None:
     store.init_db()
+    _bootstrap_admin()
     # демо-пользователь для защиты диссертационного показа
     if store.get_user_by_login("ivanov") is None:
         store.create_user("ivanov", "Demo2026!passw0rd", "Иванов А. П.",
                           "ivanov@company.local")
+
+
+def _bootstrap_admin() -> None:
+    """Создаёт первого администратора из переменных окружения MFA_ADMIN_*.
+
+    Политика OrgMFA (см. app/admin.py): self-promotion запрещён, поэтому роль
+    admin нельзя выдать ни через форму регистрации, ни через админ-консоль.
+    Единственный путь появления первого админа — bootstrap при старте сервиса:
+
+        MFA_ADMIN_LOGIN     логин (обязательно, иначе шаг пропускается)
+        MFA_ADMIN_PASSWORD  пароль   (обязательно)
+        MFA_ADMIN_EMAIL     e-mail   (опционально, нужен для алертов/восстановления)
+        MFA_ADMIN_NAME      ФИО      (опционально)
+
+    Функция идемпотентна: если учётка с таким логином уже существует — ничего
+    не меняется (перезапуск сервиса не сбрасывает пароль и права админа).
+    Созданная учётка имеет role='admin'; вход в /admin после этого требует
+    обычной двухфакторной процедуры (пароль + TOTP), привязать TOTP нужно
+    через личный кабинет при первом входе.
+    """
+    login = os.environ.get("MFA_ADMIN_LOGIN", "").strip().lower()
+    password = os.environ.get("MFA_ADMIN_PASSWORD", "")
+    if not login or not password:
+        return  # bootstrap не настроен — пропускаем (например, на тестовом стенде)
+    if store.get_user_by_login(login) is not None:
+        return  # уже существует — не трогаем (идемпотентность при рестарте)
+    try:
+        store.create_user(login, password,
+                          os.environ.get("MFA_ADMIN_NAME", ""),
+                          os.environ.get("MFA_ADMIN_EMAIL", "").strip().lower(),
+                          role="admin")
+        store.audit("admin.bootstrap.created", actor=login,
+                    details={"via": "env"})
+    except ValueError as e:
+        # слишком слабый пароль из окружения — не роняем сервис, но сигналим
+        print(f"[OrgMFA] bootstrap-администратор не создан: {e}")

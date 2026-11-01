@@ -138,6 +138,26 @@ def mail_password_reset(to: str, name: str, link: str, ttl_min: int) -> tuple[st
     return subject, text, _wrap(text.replace("\n", "<br>"))
 
 
+def mail_factor_reset(to: str, name: str, codes: list[str], login_url: str) -> tuple[str, str, str]:
+    """Письмо после административного сброса MFA-фактора.
+
+    Сам QR/секрет в письме НЕ передаётся (почтовый канал считается
+    компрометируемым): письмо только информирует и приглашает на привязку,
+    QR-код и резервные коды владелец получает лично из рук администратора.
+    """
+    subject = "OrgMFA: сброс второго фактора выполнено"
+    text = (
+        f"Здравствуйте, {name or 'сотрудник'}!\n"
+        f"Администратор выполнил сброс вашего TOTP-фактора по вашей заявке.\n"
+        f"Для восстановления доступа войдите на {login_url} — система покажет\n"
+        f"QR-код для привязки нового устройства.\n\n"
+        f"Резервные коды ({len(codes)} шт.) выданы вам лично; не пересылайте их\n"
+        f"по почте и не храните в открытом виде.\n\n"
+        f"Если вы не запрашивали сброс — немедленно сообщите администратору ИБ."
+    )
+    return subject, text, _wrap(text.replace("\n", "<br>"))
+
+
 def mail_failed_attempts(to: str, name: str, attempts: int, ip: str, lock_note: str) -> tuple[str, str, str]:
     subject = "OrgMFA: серия неудачных попыток входа"
     text = (
