@@ -6,7 +6,8 @@
     (mfa/step_up/setup) короткоживущие; authed — до {{ '8 ч' }} для пользователей и 2 ч для админов.</div>
 
   <table class="grid">
-    <tr><th>Пользователь</th><th>Стадия</th><th>IP</th><th>User-Agent</th>
+    <tr><th>Пользователь</th><th>Стадия</th><th>IP</th><th>Браузер / ОС</th>
+        <th>User-Agent</th>
         <th>Risk score</th><th>Создана</th><th>Истекает</th></tr>
     {% for s in rows %}
     <tr>
@@ -14,7 +15,11 @@
       <td><span class="badge {{ 'on' if s.stage=='authed' else ('warn' if s.stage in ('mfa','step_up') else 'off') }}">
             {{ s.stage }}</span></td>
       <td>{{ s.ip }}</td>
-      <td>{{ (s.user_agent or "")[:70] }}</td>
+      <td>{{ s.browser }} · {{ s.os }}</td>
+      {# Полная строка UA доступна по наведению (title); сокращение в таблице —
+         только косметическое: UA разных Chromium-браузеров совпадает в начале.
+         Не использовать UA как надёжный идентификатор устройства — он подделывается. #}
+      <td title="{{ s.user_agent or '' }}">{{ (s.user_agent or "")[:70] }}{{ '…' if (s.user_agent or '')|length > 70 else '' }}</td>
       <td>{{ s.risk_score or 0 }}</td>
       <td>{{ s.created_at|timestamp_fmt }}</td>
       <td>{{ s.expires_at|timestamp_fmt }}</td>

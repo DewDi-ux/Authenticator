@@ -1,0 +1,53 @@
+{% extends "admin_base.html" %}
+{% set standalone = true %}
+{% block title %}Подтверждение TOTP — OrgMFA Admin{% endblock %}
+{% block solo_content %}
+  <h1>Админ-консоль · ступень 2</h1>
+  <div class="sub">Введите текущий 6-значный код TOTP из приложения-аутентификатора.</div>
+
+  <div id="err" class="msg err" style="display:none"></div>
+  <div id="info" class="msg info" style="display:none"></div>
+
+  <form id="totp-form" autocomplete="off">
+    <label for="code">Код TOTP</label>
+    <input id="code" name="code" type="text" inputmode="numeric" pattern="[0-9]{6}"
+           maxlength="7" placeholder="123456" required autofocus>
+    {# Третий фактор при стадии step_up (высокий риск входа): без резервного
+       кода вход в админ-консоль не завершается. На обычной mfa-стадии поле
+       игнорируется сервером. #}
+    <div id="rc-wrap" style="display:none">
+      <label for="recovery_code">Резервный код (третий фактор)</label>
+      <input id="recovery_code" name="recovery_code" type="text"
+             placeholder="xxxxx-xxxxx">
+    </div>
+    <button type="submit">Войти в консоль</button>
+  </form>
+
+  <div class="links"><a href="/admin/login">Отменить</a></div>
+{% endblock %}
+{% block scripts %}
+<script>
+const totpForm = document.getElementById("totp-form");
+let stepUp = false;   // сервер перевёл сессию в step_up — нужен резервный код
+
+async function submitTotp() {
+  const {data} = await adminPost("/admin/mfa", new FormData(totpForm));
+  if (data.ok) { location.href = data.redirect; return; }
+  if (data.step_up) {
+    // стадия step_up: TOTP принят, ожидается один резервный код
+    stepUp = true;
+    document.getElementById("rc-wrap").style.display = "block";
+    showMsg(document.getElementById("info"),
+            data.message || "Требуется резервный код (третий фактор).", "info");
+    return;
+  }
+  showMsg(document.getElementById("err"), data.error || "Ошибка.", "err");
+}
+totpForm.addEventListener("submit", async ev => {
+  ev.preventDefault();
+  // пока не получен TOTP и идёт первый проход — резервный код не отправляем
+  if (!stepUp) document.getElementById("recovery_code").value = "";
+  await submitTotp();
+});
+</script>
+{% endblock %}
