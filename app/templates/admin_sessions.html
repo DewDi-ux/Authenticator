@@ -1,0 +1,25 @@
+{% extends "admin_base.html" %}
+{% block title %}Активные сессии — OrgMFA Admin{% endblock %}
+{% block content %}
+  <h1>Активные сессии</h1>
+  <div class="sub">Все живые сессии IdP на {{ now|timestamp_fmt }}. Промежуточные стадии
+    (mfa/step_up/setup) короткоживущие; authed — до {{ '8 ч' }} для пользователей и 2 ч для админов.</div>
+
+  <table class="grid">
+    <tr><th>Пользователь</th><th>Стадия</th><th>IP</th><th>User-Agent</th>
+        <th>Risk score</th><th>Создана</th><th>Истекает</th></tr>
+    {% for s in rows %}
+    <tr>
+      <td>{{ s.login }}</td>
+      <td><span class="badge {{ 'on' if s.stage=='authed' else ('warn' if s.stage in ('mfa','step_up') else 'off') }}">
+            {{ s.stage }}</span></td>
+      <td>{{ s.ip }}</td>
+      <td>{{ (s.user_agent or "")[:70] }}</td>
+      <td>{{ s.risk_score or 0 }}</td>
+      <td>{{ s.created_at|timestamp_fmt }}</td>
+      <td>{{ s.expires_at|timestamp_fmt }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% if not rows %}<div class="msg ok">Активных сессий нет.</div>{% endif %}
+{% endblock %}

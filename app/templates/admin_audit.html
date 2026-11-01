@@ -1,0 +1,34 @@
+{% extends "admin_base.html" %}
+{% block title %}Журнал безопасности — OrgMFA Admin{% endblock %}
+{% block content %}
+  <h1>Журнал событий (audit_log)</h1>
+  <div class="sub">Append-only журнал. Фильтры: префикс события, субъект, только неудачные.</div>
+
+  <form method="get" action="/admin/audit" style="display:flex;gap:10px;flex-wrap:wrap;align-items:end">
+    <div><label>Событие (префикс)</label>
+      <input name="q_event" type="text" placeholder="auth.fail / admin." value="{{ q_event }}"></div>
+    <div><label>Субъект</label>
+      <input name="q_actor" type="text" placeholder="ivanov" value="{{ q_actor }}"></div>
+    <label style="width:auto"><input type="checkbox" name="failed_only" value="1"
+           {% if failed_only %}checked{% endif %} style="width:auto"> только неудачные</label>
+    <button type="submit" style="margin-top:0">Фильтровать</button>
+  </form>
+
+  <p><a href="/admin/audit/export.csv">Экспорт в CSV (до 5000 строк, событие пишется в журнал)</a></p>
+
+  <table class="grid">
+    <tr><th>ID</th><th>Время</th><th>Событие</th><th>Субъект</th><th>IP</th><th>Успех</th><th>Детали</th></tr>
+    {% for e in rows %}
+    <tr>
+      <td>{{ e.id }}</td>
+      <td>{{ e.ts|timestamp_fmt }}</td>
+      <td><code>{{ e.event }}</code></td>
+      <td>{{ e.actor or "—" }}</td>
+      <td>{{ e.ip or "—" }}</td>
+      <td>{{ "✓" if e.success else "✗" }}</td>
+      <td>{{ e.details }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% if not rows %}<div class="msg info">Нет событий по заданным фильтрам.</div>{% endif %}
+{% endblock %}

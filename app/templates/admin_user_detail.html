@@ -1,0 +1,89 @@
+{% extends "admin_base.html" %}
+{% block title %}{{ t.login }} — OrgMFA Admin{% endblock %}
+{% block content %}
+  <h1>Учётная запись: {{ t.login }}</h1>
+  <div class="sub">{{ t.full_name or "ФИО не указано" }} · {{ t.email or "без e-mail" }} ·
+    роль <span class="badge {{ 'admin' if t.is_admin else 'user' }}">{{ t.role }}</span> ·
+    создана {{ t.created_at|timestamp_fmt if t.created_at is defined else "—" }}</div>
+
+  <p>
+    {% if t.disabled %}<span class="badge off">деактивирована</span>{% endif %}
+    {% if t.mfa_enabled %}<span class="badge on">MFA включена</span>{% else %}
+      <span class="badge off">MFA не подтверждена</span>{% endif %}
+    {% if risk.is_locked(t) %}<span class="badge warn">заблокирована до {{ t.locked_until|timestamp_fmt }}</span>{% endif %}
+    Неудачных попыток подряд: {{ t.failed_attempts }} · резервных кодов: {{ t.recovery_hashes|length }}
+  </p>
+  <div id="msg" class="msg" style="display:none"></div>
+
+  <h2>Действия (каждое требует step-up)</h2>
+  <button class="ghost" onclick="act('unlock', {}, 'Блокировка снята')">Разблокировать</button>
+  <button class="ghost" onclick="act('drop-sessions', {}, 'Сессии сброшены')">Сбросить сессии</button>
+  <button class="ghost" onclick="act('force-relogin', {}, 'Требуется повторный вход')">Принудительный relogin</button>
+  {% if not t.disabled %}
+  <button class="danger" onclick="disableUser()">Деактивировать</button>
+  {% else %}
+  <button class="ghost" onclick="act('enable', {}, 'Учётка активна')">Активировать</button>
+  {% endif %}
+  {% if not t.is_admin %}
+  <button class="danger" onclick="resetFactor()">Сбросить фактор MFA (инцидент ИБ)</button>
+  {% endif %}
+
+  <div id="factor-result" style="display:none">
+    <h2>Новый фактор (передать владельцу лично!)</h2>
+    <img id="qr" alt="QR otpauth://" style="max-width:220px;border:1px solid #e2e8f0;border-radius:8px">
+    <p><code id="uri"></code></p>
+    <pre class="json" id="codes"></pre>
+  </div>
+
+  <h2>Активные сессии</h2>
+  {% if sessions %}
+  <table class="grid">
+    <tr><th>Стадия</th><th>IP</th><th>User-Agent</th><th>Создана</th><th>Истекает</th></tr>
+    {% for s in sessions %}
+    <tr><td>{{ s.stage }}</td><td>{{ s.ip }}</td><td>{{ s.user_agent[:60] }}</td>
+        <td>{{ s.created_at|timestamp_fmt }}</td><td>{{ s.expires_at|timestamp_fmt }}</td></tr>
+    {% endfor %}
+  </table>
+  {% else %}<div class="sub">Активных сессий нет.</div>{% endif %}
+
+  <h2>Последние события по учётке</h2>
+  <table class="grid">
+    <tr><th>Время</th><th>Событие</th><th>IP</th><th>Успех</th><th>Детали</th></tr>
+    {% for e in events %}
+    <tr><td>{{ e.ts|timestamp_fmt }}</td><td><code>{{ e.event }}</code></td>
+        <td>{{ e.ip }}</td><td>{{ "✓" if e.success else "✗" }}</td><td>{{ e.details }}</td></tr>
+    {% endfor %}
+  </table>
+{% endblock %}
+{% block scripts %}
+<script>
+const UID = "{{ t.id }}";
+async function act(action, data, okText) {
+  const r = await adminPost(`/admin/users/${UID}/${action}`, new URLSearchParams(data));
+  if (r.status >= 300 && r.status < 400) {
+    location.href = `/admin/reauth?next=/admin/users/${UID}`; return; }
+  showMsg(document.getElementById("msg"),
+          r.data.message || r.data.error || okText, r.data.ok ? "ok" : "err");
+  if (r.data.ok && action !== "reset-factor") setTimeout(() => location.reload(), 900);
+}
+async function disableUser() {
+  const c = prompt("Для деактивации введите логин «{{ t.login }}»:");
+  if (c === null) return;
+  act("disable", {confirm: c}, "Деактивировано");
+}
+async function resetFactor() {
+  const reason = prompt("Основание сброса фактора (акт инцидента ИБ):") || "";
+  if (prompt("Подтвердите сброс TOTP и перевыпуск резервных кодов (введите RESET):") !== "RESET") return;
+  const r = await adminPost(`/admin/users/${UID}/reset-factor`, {reason, notify: "on"});
+  if (r.status >= 300 && r.status < 400) {
+    location.href = `/admin/reauth?next=/admin/users/${UID}`; return; }
+  if (!r.data.ok) {
+    showMsg(document.getElementById("msg"), r.data.message || r.data.error, "err"); return; }
+  document.getElementById("factor-result").style.display = "block";
+  document.getElementById("qr").src = r.data.qr_png;
+  document.getElementById("uri").textContent = r.data.otpauth_uri;
+  document.getElementById("codes").textContent = (r.data.recovery_codes || []).join("\n");
+  showMsg(document.getElementById("msg"), r.data.message, "ok");
+}
+</script>
+{% endblock %}

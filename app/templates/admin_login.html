@@ -1,0 +1,18 @@
+{% extends "admin_base.html" %}
+{% set standalone = true %}
+{% block title %}Вход администратора — OrgMFA{% endblock %}
+{% block solo_content %}
+  <h1>Админ-консоль OrgMFA</h1>
+  <div class="sub">Ступень 1 из 2 — пароль. Доступ только из доверенных сетей организации.</div>
+
+  {% if msg %}<div class="msg err">{{ msg }}</div>{% endif %}
+
+  <form method="post" action="/admin/login" autocomplete="off">
+    <label for="login">Логин администратора</label>
+    <input id="login" name="login" type="text" required autofocus>
+    <label for="password">Пароль</label>
+    <input id="password" name="password" type="password" required>
+    <button type="submit">Далее → TOTP</button>
+  </form>
+  <div class="links"><a href="/">← Обычный вход</a></div>
+{% endblock %}

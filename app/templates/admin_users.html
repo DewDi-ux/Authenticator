@@ -1,0 +1,86 @@
+{% extends "admin_base.html" %}
+{% block title %}Пользователи — OrgMFA Admin{% endblock %}
+{% block content %}
+  <h1>Учётные записи</h1>
+  <div class="sub">Критические действия требуют step-up (повторный пароль). Роль admin из UI не выдаётся.</div>
+
+  <table class="grid">
+    <tr>
+      <th>Логин</th><th>ФИО</th><th>E-mail</th><th>Роль</th><th>MFA</th>
+      <th>Рез. коды</th><th>Неудачи</th><th>Статус</th><th>Действия</th>
+    </tr>
+    {% for x in rows %}
+    <tr>
+      <td><a href="/admin/users/{{ x.id }}">{{ x.login }}</a></td>
+      <td>{{ x.full_name or "—" }}</td>
+      <td>{{ x.email or "—" }}</td>
+      <td><span class="badge {{ 'admin' if x.role=='admin' else 'user' }}">{{ x.role }}</span></td>
+      <td>{% if x.mfa_enabled %}<span class="badge on">включена</span>
+          {% elif x.has_factor %}<span class="badge warn">ожидает подтверждения</span>
+          {% else %}<span class="badge off">нет фактора</span>{% endif %}</td>
+      <td>{{ x.recovery_left }}</td>
+      <td>{{ x.failed }}</td>
+      <td>
+        {% if x.disabled %}<span class="badge off">деактивирована</span>
+        {% elif x.locked_now %}<span class="badge warn">заблокирована до {{ x.locked_until|timestamp_fmt }}</span>
+        {% else %}<span class="badge on">активна</span>{% endif %}
+      </td>
+      <td>
+        {% if x.locked_now %}
+        <button class="ghost" onclick="act('/admin/users/{{ x.id }}/unlock', {}, this)">Разблокировать</button>
+        {% endif %}
+        {% if x.disabled %}
+        <button class="ghost" onclick="act('/admin/users/{{ x.id }}/enable', {}, this)">Активировать</button>
+        {% elif x.login != me.login %}
+        <button class="danger" onclick="disableUser('{{ x.id }}', '{{ x.login }}')">Деактивировать</button>
+        {% endif %}
+        <button class="ghost" onclick="act('/admin/users/{{ x.id }}/drop-sessions', {}, this)">Сброс сессий</button>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  <div id="msg" class="msg" style="display:none"></div>
+
+  <h2>Создать учётную запись</h2>
+  <form id="create-form" autocomplete="off">
+    <label>Логин</label><input name="login" type="text" required>
+    <label>ФИО</label><input name="full_name" type="text">
+    <label>E-mail</label><input name="email" type="text">
+    <label>Временный пароль (политика: ≥10 симв., буквы+цифры+спецсимвол)</label>
+    <input name="password" type="password" required minlength="10">
+    <label><input type="checkbox" name="must_change" value="on" checked style="width:auto">
+      потребовать смены пароля/привязки MFA при первом входе</label>
+    <button type="submit">Создать</button>
+  </form>
+{% endblock %}
+{% block scripts %}
+<script>
+async function act(url, data, btn) {
+  const r = await adminPost(url, new URLSearchParams(data));
+  if (r.status === 303 || r.status >= 300 && r.status < 400) { location.href = "/admin/reauth?next=" + url; return; }
+  showMsg(document.getElementById("msg"),
+          r.data.message || r.data.error || "Готово",
+          r.data.ok ? "ok" : "err");
+  if (r.data.ok) setTimeout(() => location.reload(), 900);
+}
+async function disableUser(id, login) {
+  const c = prompt(`Для деактивации «${login}» введите логин ещё раз:`);
+  if (c === null) return;
+  const r = await adminPost(`/admin/users/${id}/disable`, {confirm: c});
+  if (r.status >= 300 && r.status < 400) { location.href = "/admin/reauth?next=/admin/users"; return; }
+  showMsg(document.getElementById("msg"), r.data.message || r.data.error,
+          r.data.ok ? "ok" : "err");
+  if (r.data.ok) setTimeout(() => location.reload(), 900);
+}
+document.getElementById("create-form").addEventListener("submit", async ev => {
+  ev.preventDefault();
+  const fd = new FormData(ev.target);
+  if (!fd.get("must_change")) fd.set("must_change", "");
+  const r = await adminPost("/admin/users/create", fd);
+  if (r.status >= 300 && r.status < 400) { location.href = "/admin/reauth?next=/admin/users"; return; }
+  showMsg(document.getElementById("msg"), r.data.message || r.data.error,
+          r.data.ok ? "ok" : "err");
+  if (r.data.ok) setTimeout(() => location.reload(), 1200);
+});
+</script>
+{% endblock %}

@@ -36,6 +36,10 @@ from . import mailer, risk, security, store
 
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
+# Фильтр шаблона: unix-время -> человекочитаемая дата (журнал, сессии)
+templates.env.filters["timestamp_fmt"] = lambda ts: time.strftime(
+    "%d.%m %H:%M:%S", time.localtime(ts))
+
 # --- параметры политики админ-зоны (см. docs/SECURITY.md, раздел 17) --------
 ADMIN_SESSION_TTL = 2 * 3600.0   # короче обычной AUTHED_TTL (8 ч)
 ADMIN_STEPUP_TTL = 120.0         # окно на повторный пароль после TOTP
@@ -50,6 +54,10 @@ def _ip(request: Request) -> str:
 
 
 def _page(request: Request, name: str, ctx: dict, status: int = 200):
+    # error.html наследует standalone-макет (без админской навигации),
+    # страницы консоли — общий admin_base с шапкой
+    if name == "error.html":
+        ctx = {**ctx, "standalone": True}
     return templates.TemplateResponse(request, name, ctx, status_code=status)
 
 
@@ -203,12 +211,7 @@ async def admin_login(request: Request, login: str = Form(...),
             status=403)
     # оценка риска как в пользовательском входе; высокий риск -> step_up
     # (после TOTP потребуется резервный код — третий фактор для админ-зоны)
-    last_ts = None
-    with store._conn() as c:
-        r = c.execute("SELECT ts FROM audit_log WHERE event='admin.login.success'"
-                      " AND actor=? ORDER BY id DESC LIMIT 1",
-                      (u.login,)).fetchone()
-        last_ts = r["ts"] if r else None
+    last_ts = _last_admin_login_ts(u.login)
     minutes_since = (time.time() - last_ts) / 60 if last_ts else None
     agent = request.headers.get("user-agent", "")[:200]
     score, reasons = risk.score_login(ip, agent, None, 0, minutes_since)
@@ -232,6 +235,17 @@ async def _dummy_hash(pw: str) -> None:
     import asyncio
     await asyncio.sleep(0)
     security.hash_password(pw or "x")
+
+
+def _last_admin_login_ts(login: str) -> float | None:
+    """Время последнего успешного входа администратором (для признака
+    «спящий аккаунт» в модели риска). Учитывает и обычные authed-входы."""
+    with store._conn() as c:
+        r = c.execute(
+            "SELECT ts FROM audit_log WHERE actor=? AND ("
+            "event='admin.login.success' OR event='auth.success'"
+            ") ORDER BY id DESC LIMIT 1", (login,)).fetchone()
+    return r["ts"] if r else None
 
 
 @router.get("/mfa", response_class=HTMLResponse)
@@ -370,7 +384,7 @@ async def user_detail(request: Request, uid: str):
     sess = store.user_sessions(target.id)
     return _page(request, "admin_user_detail.html", {
         "me": u, "t": target, "events": events, "sessions": sess,
-        "now": time.time()})
+        "risk": risk, "now": time.time()})
 
 
 # ---------------------------------------------------------------------------
