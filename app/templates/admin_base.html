@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>{% block title %}OrgMFA · Админ-консоль{% endblock %}</title>
+  <style>
+    :root { --accent:#0f766e; --bg:#f1f5f9; --card:#fff; --err:#dc2626; --ok:#16a34a;
+            --ink:#0f172a; --mut:#64748b; }
+    * { box-sizing: border-box; }
+    body { font-family: "Segoe UI", Roboto, sans-serif; background: var(--bg); margin:0; color:var(--ink); }
+    header.topbar { background:#0f172a; color:#e2e8f0; padding:12px 22px;
+                    display:flex; align-items:center; gap:18px; flex-wrap:wrap; }
+    header.topbar .brand { font-weight:700; letter-spacing:.3px; }
+    header.topbar nav { display:flex; gap:14px; flex-wrap:wrap; }
+    header.topbar nav a { color:#cbd5e1; text-decoration:none; font-size:.9rem; }
+    header.topbar nav a:hover, header.topbar nav a.active { color:#fff; text-decoration:underline; }
+    header.topbar .who { margin-left:auto; font-size:.82rem; color:#94a3b8; }
+    main { max-width:1080px; margin:26px auto; padding:0 18px; }
+    .card { background:var(--card); border-radius:14px; box-shadow:0 8px 30px rgba(2,6,23,.08);
+            padding:26px 30px; width:100%; }
+    .center-wrap { display:flex; min-height:100vh; align-items:center; justify-content:center; }
+    h1 { font-size:1.25rem; margin:0 0 4px; }
+    h2 { font-size:1.02rem; margin:22px 0 8px; }
+    .sub { color:var(--mut); font-size:.85rem; margin-bottom:18px; }
+    label { display:block; font-size:.82rem; color:#334155; margin:12px 0 4px; }
+    input[type=text], input[type=password], input[type=email], select {
+            width:100%; padding:9px 11px; border:1px solid #cbd5e1; border-radius:8px; font-size:.95rem; }
+    input:focus, select:focus { outline:2px solid var(--accent); border-color:transparent; }
+    button { margin-top:16px; padding:10px 16px; background:var(--accent); color:#fff;
+             border:0; border-radius:8px; font-size:.95rem; cursor:pointer; }
+    button:hover { filter:brightness(1.1); }
+    button.danger { background:var(--err); }
+    button.ghost { background:#e2e8f0; color:#334155; }
+    .inline-form { display:inline; }
+    .msg { padding:10px 12px; border-radius:8px; font-size:.88rem; margin:12px 0; }
+    .msg.err { background:#fef2f2; color:var(--err); border:1px solid #fecaca; }
+    .msg.ok { background:#f0fdf4; color:var(--ok); border:1px solid #bbf7d0; }
+    .msg.info { background:#e0f2fe; border:1px solid #0ea5e9; }
+    table.grid { width:100%; border-collapse:collapse; font-size:.85rem; margin-top:12px; }
+    table.grid th, table.grid td { padding:7px 9px; border-bottom:1px solid #e2e8f0; text-align:left;
+            vertical-align:top; }
+    table.grid th { background:#f8fafc; color:#334155; font-weight:600; white-space:nowrap; }
+    .badge { display:inline-block; padding:2px 8px; border-radius:999px; font-size:.75rem; }
+    .badge.admin { background:#ccfbf1; color:#0f766e; }
+    .badge.user { background:#e2e8f0; color:#475569; }
+    .badge.on { background:#dcfce7; color:#166534; }
+    .badge.off { background:#fee2e2; color:#991b1b; }
+    .badge.warn { background:#fef3c7; color:#92400e; }
+    .stat-grid { display:flex; gap:14px; flex-wrap:wrap; margin:14px 0; }
+    .stat { background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px;
+            padding:12px 16px; min-width:130px; }
+    .stat b { display:block; font-size:1.4rem; }
+    .stat span { font-size:.78rem; color:var(--mut); }
+    code { background:#f8fafc; border:1px solid #e2e8f0; border-radius:6px; padding:2px 6px; word-break:break-all; }
+    .links { margin-top:16px; font-size:.85rem; }
+    pre.json { background:#0f172a; color:#e2e8f0; padding:14px; border-radius:10px; overflow:auto; font-size:.8rem; }
+  </style>
+</head>
+<body>
+{% if standalone is defined and standalone %}
+  <div class="center-wrap"><div class="card" style="max-width:480px">
+    {% block solo_content %}{% endblock %}
+  </div></div>
+{% else %}
+  <header class="topbar">
+    <span class="brand">OrgMFA · Админ-консоль</span>
+    <nav>
+      <a href="/admin">Дашборд</a>
+      <a href="/admin/users">Пользователи</a>
+      <a href="/admin/audit">Журнал</a>
+      <a href="/admin/sessions">Сессии</a>
+      <a href="/admin/policy">Политики</a>
+    </nav>
+    <span class="who">
+      {% if me is defined and me %}{{ me.login }} ({{ 'admin' if me.is_admin else 'user' }}) ·
+      {% endif %}
+      <a href="/logout" style="color:#fca5a5">Выйти</a>
+    </span>
+  </header>
+  <main><div class="card">
+    {% block content %}{% endblock %}
+  </div></main>
+{% endif %}
+<script>
+// Универсальная отправка AJAX-форм (все админские действия возвращают JSON)
+async function adminPost(url, formOrData) {
+  const body = formOrData instanceof FormData || formOrData instanceof URLSearchParams
+    ? formOrData : new URLSearchParams(formOrData);
+  const r = await fetch(url, {method:"POST", body, headers:{"Accept":"application/json"}});
+  let data; try { data = await r.json(); } catch(e) { data = {error:"bad_response"}; }
+  return {status:r.status, data};
+}
+function showMsg(el, text, cls) {
+  el.textContent = text; el.className = "msg " + (cls||"info"); el.style.display = "block";
+}
+</script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

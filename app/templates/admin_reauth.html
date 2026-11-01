@@ -1,0 +1,19 @@
+{% extends "admin_base.html" %}
+{% set standalone = true %}
+{% block title %}Подтверждение действия — OrgMFA Admin{% endblock %}
+{% block solo_content %}
+  <h1>Step-up: подтвердите действие паролем</h1>
+  <div class="sub">Критическое административное действие требует повторного ввода
+    пароля. Окно подтверждения — 2 минуты, разрешение одноразовое.</div>
+
+  {% if msg %}<div class="msg err">{{ msg }}</div>{% endif %}
+
+  <form method="post" action="/admin/reauth" autocomplete="off">
+    <input type="hidden" name="next" value="{{ next }}">
+    <label for="password">Пароль администратора</label>
+    <input id="password" name="password" type="password" required autofocus>
+    <button type="submit">Подтвердить и продолжить</button>
+  </form>
+
+  <div class="links"><a href="/admin">← Отмена, к дашборду</a></div>
+{% endblock %}

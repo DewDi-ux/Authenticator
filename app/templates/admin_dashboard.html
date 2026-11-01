@@ -1,0 +1,48 @@
+{% extends "admin_base.html" %}
+{% block title %}Дашборд — OrgMFA Admin{% endblock %}
+{% block content %}
+  <h1>Обзор безопасности</h1>
+  <div class="sub">Сводка состояния IdP на момент {{ now|timestamp_fmt }}</div>
+
+  <div class="stat-grid">
+    <div class="stat"><b>{{ stats.users_total }}</b><span>учётных записей</span></div>
+    <div class="stat"><b>{{ stats.admins }}</b><span>активных админов</span></div>
+    <div class="stat"><b>{{ stats.mfa_on }}</b><span>MFA привязано</span></div>
+    <div class="stat"><b>{{ stats.locked }}</b><span>заблокировано</span></div>
+    <div class="stat"><b>{{ stats.disabled }}</b><span>деактивировано</span></div>
+    <div class="stat"><b>{{ stats.sessions }}</b><span>активных сессий</span></div>
+  </div>
+
+  <h2>Последние неудачные события</h2>
+  {% if recent_fail %}
+  <table class="grid">
+    <tr><th>Время</th><th>Событие</th><th>Субъект</th><th>IP</th><th>Детали</th></tr>
+    {% for e in recent_fail %}
+    <tr>
+      <td>{{ e.ts|timestamp_fmt }}</td>
+      <td><code>{{ e.event }}</code></td>
+      <td>{{ e.actor or "—" }}</td>
+      <td>{{ e.ip }}</td>
+      <td>{{ e.details }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}<div class="msg ok">Неудачных событий нет.</div>{% endif %}
+
+  <h2>Подозрительные оценки риска (score ≥ 55)</h2>
+  {% if risky %}
+  <table class="grid">
+    <tr><th>Время</th><th>Субъект</th><th>IP</th><th>Решение</th></tr>
+    {% for e in risky %}
+    <tr>
+      <td>{{ e.ts|timestamp_fmt }}</td>
+      <td>{{ e.actor }}</td>
+      <td>{{ e.ip }}</td>
+      <td>{{ e.details }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}<div class="msg ok">Нет входов с высоким риском.</div>{% endif %}
+
+  <div class="links"><a href="/admin/audit">Полный журнал →</a></div>
+{% endblock %}

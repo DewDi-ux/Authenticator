@@ -1,0 +1,45 @@
+{% extends "admin_base.html" %}
+{% block title %}Политики безопасности — OrgMFA Admin{% endblock %}
+{% block content %}
+  <h1>Политики безопасности</h1>
+  <div class="sub">Runtime-настройка стенда. В промышленной версии значения живут в
+    конфиге и меняются через Change Management. Сохранение требует step-up.</div>
+
+  <div id="cur"></div>
+
+  <h2>Изменить пороги</h2>
+  <form id="policy-form" autocomplete="off">
+    <label>Порог step-up, score (сейчас см. policy.json)</label>
+    <input name="step_up" type="text" placeholder="55">
+    <label>Порог block, score</label><input name="block" type="text" placeholder="85">
+    <label>Неудачных попыток до блокировки</label><input name="max_failed" type="text" placeholder="5">
+    <label>Длительность блокировки, минут</label><input name="lockout_min" type="text" placeholder="15">
+    <label>Rate limit: максимум попыток с IP за окно</label><input name="rate_max" type="text" placeholder="10">
+    <label>Рабочие часы: начало / конец (часы суток)</label>
+    <div style="display:flex;gap:8px">
+      <input name="work_start" type="text" placeholder="8">
+      <input name="work_end" type="text" placeholder="19">
+    </div>
+    <button type="submit">Применить (через step-up)</button>
+  </form>
+  <div id="msg" class="msg" style="display:none"></div>
+{% endblock %}
+{% block scripts %}
+<script>
+fetch("/admin/policy.json", {headers:{"Accept":"application/json"}})
+  .then(r => r.json())
+  .then(d => {
+    const el = document.getElementById("cur");
+    el.innerHTML = "<h2>Текущие значения</h2><pre class='json'>" +
+                   JSON.stringify(d, null, 2) + "</pre>";
+  }).catch(() => {});
+document.getElementById("policy-form").addEventListener("submit", async ev => {
+  ev.preventDefault();
+  const r = await adminPost("/admin/policy", new FormData(ev.target));
+  if (r.status >= 300 && r.status < 400) {
+    location.href = "/admin/reauth?next=/admin/policy"; return; }
+  showMsg(document.getElementById("msg"),
+          r.data.message || JSON.stringify(r.data), r.data.ok ? "ok" : "err");
+});
+</script>
+{% endblock %}

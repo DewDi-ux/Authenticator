@@ -1,0 +1,28 @@
+{% extends "admin_base.html" %}
+{% set standalone = true %}
+{% block title %}Подтверждение TOTP — OrgMFA Admin{% endblock %}
+{% block solo_content %}
+  <h1>Админ-консоль · ступень 2</h1>
+  <div class="sub">Введите текущий 6-значный код TOTP из приложения-аутентификатора.</div>
+
+  <div id="err" class="msg err" style="display:none"></div>
+
+  <form id="totp-form" autocomplete="off">
+    <label for="code">Код TOTP</label>
+    <input id="code" name="code" type="text" inputmode="numeric" pattern="[0-9]{6}"
+           maxlength="7" placeholder="123456" required autofocus>
+    <button type="submit">Войти в консоль</button>
+  </form>
+
+  <div class="links"><a href="/admin/login">Отменить</a></div>
+{% endblock %}
+{% block scripts %}
+<script>
+document.getElementById("totp-form").addEventListener("submit", async ev => {
+  ev.preventDefault();
+  const {data} = await adminPost("/admin/mfa", new FormData(ev.target));
+  if (data.ok) location.href = data.redirect;
+  else showMsg(document.getElementById("err"), data.error || "Ошибка.", "err");
+});
+</script>
+{% endblock %}
