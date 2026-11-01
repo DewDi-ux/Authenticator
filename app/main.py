@@ -233,12 +233,21 @@ def _reset_link(request: Request, token: str) -> str:
 async def register(request: Request, login: str = Form(...),
                    full_name: str = Form(""), password: str = Form(...),
                    password2: str = Form(...), email: str = Form("")):
+    """Саморегистрация учётной записи.
+
+    E-mail нормализуется и проверяется на формат; дубликат логина/почты даёт
+    одинаково нейтральное сообщение (без раскрытия, чем именно занят аккаунт).
+    Для учебного стенда почта факультативна: пустой адрес разрешён (тогда
+    уведомления о переборе и восстановление пароля для учётки недоступны).
+    Браузерная форма требует почту через input[type=email][required],
+    строгая политика — на стороне ИБ-регламента, не формы регистрации.
+    """
     ip = client_ip(request)
     email = email.strip().lower()
     if password != password2:
         msg = "Пароли не совпадают."
         return templates.TemplateResponse(request, "register.html", {"msg": msg}, status_code=400)
-    if not security.valid_email(email):
+    if email and not security.valid_email(email):
         return templates.TemplateResponse(
             request, "register.html",
             {"msg": "Укажите корректную электронную почту — на неё придут "
@@ -393,9 +402,18 @@ def _set_cookie(resp, token: str) -> None:
 
 
 def _last_success_ts(user_id: str) -> float | None:
+    """Время последнего УСПЕШНОГО полного входа (после всех факторов).
+
+    Учитываем оба контура: пользовательский (`auth.success`, `auth.success_recovery`)
+    и интеграционный ИС (`integration.auth.success*`) — иначе вход через API-контур
+    не продлевает «историю доверия» и свежая сессия ошибочно помечалась бы
+    реактивацией спящей учётки (dormant account).
+    """
     with store._conn() as c:
         r = c.execute(
-            "SELECT ts FROM audit_log WHERE event='auth.success' AND actor=("
+            "SELECT ts FROM audit_log WHERE ("
+            "event='auth.success' OR event='auth.success_recovery' OR "
+            "event LIKE 'integration.auth.success%') AND actor=("
             "SELECT login FROM users WHERE id=?) ORDER BY id DESC LIMIT 1",
             (user_id,)).fetchone()
     return r["ts"] if r else None

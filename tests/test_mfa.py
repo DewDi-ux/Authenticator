@@ -426,11 +426,13 @@ class TestStepUpFlow:
         self._login_step_up(client)
         r = client.post("/verify-recovery", data={"code": codes[0]})
         assert r.json()["ok"] is False and r.json()["step_up_pending"] is True
+        u = store.get_user_by_login("sidorov")
+        assert len(u.recovery_hashes) == 9     # первый код израсходован
         # второй резервный код НЕ расходуется, пока не введён TOTP
         r2 = client.post("/verify-recovery", data={"code": codes[1]})
         assert r2.json()["ok"] is False
         u = store.get_user_by_login("sidorov")
-        assert len(u.recovery_hashes) == 9
+        assert len(u.recovery_hashes) == 9     # ровно один расход на сессию
         import time as _t
         _t.sleep(31)   # свежий TOTP (завершённое окно), чтобы не撞上 replay-детектор
         r3 = client.post("/verify-totp", data={"code": security.totp_now(seed)})
@@ -546,11 +548,12 @@ class TestIntegrationAPI:
         подменяем время последнего успешного входа на 40 дней назад."""
         seed, _ = self._enrolled_user(client)
         with store._conn() as c:
-            login_ts = c.execute("SELECT login FROM users WHERE id IN "
-                                 "(SELECT user_id FROM sessions)").fetchall()
-            # помечаем все успешные входы старыми
+            # помечаем все успешные входы старыми (учётка «спала» 40 дней).
+            # В ИС-контуре шаг 2 пишется событие integration.auth.success —
+            # его тоже сдвигаем, иначе свежий вход обнуляет признак dormant.
             old = __import__("time").time() - 40 * 24 * 3600
-            c.execute("UPDATE audit_log SET ts=? WHERE event='auth.success'", (old,))
+            c.execute("UPDATE audit_log SET ts=? WHERE event IN "
+                      "('auth.success', 'integration.auth.success')", (old,))
         r = client.post("/api/auth/login", headers=self._hdr(),
                         json={"login": "smith", "password": self.PASSWORD})
         reasons = r.json()["risk"]["reasons"]
