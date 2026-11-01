@@ -57,6 +57,10 @@
 <script>
 async function act(url, data, btn) {
   const r = await adminPost(url, new URLSearchParams(data));
+  if (r.data && r.data.error === "reauth_required") {
+    showMsg(document.getElementById("msg"),
+            "Требуется повторный ввод пароля (step-up). Перенаправление…", "info");
+    location.href = r.data.reauth_url || "/admin/reauth?next=/admin/users"; return; }
   if (r.status === 303 || r.status >= 300 && r.status < 400) { location.href = "/admin/reauth?next=" + url; return; }
   showMsg(document.getElementById("msg"),
           r.data.message || r.data.error || "Готово",
@@ -67,6 +71,10 @@ async function disableUser(id, login) {
   const c = prompt(`Для деактивации «${login}» введите логин ещё раз:`);
   if (c === null) return;
   const r = await adminPost(`/admin/users/${id}/disable`, {confirm: c});
+  if (r.data && r.data.error === "reauth_required") {
+    showMsg(document.getElementById("msg"),
+            "Требуется повторный ввод пароля (step-up). Перенаправление…", "info");
+    location.href = r.data.reauth_url || "/admin/reauth?next=/admin/users"; return; }
   if (r.status >= 300 && r.status < 400) { location.href = "/admin/reauth?next=/admin/users"; return; }
   showMsg(document.getElementById("msg"), r.data.message || r.data.error,
           r.data.ok ? "ok" : "err");
@@ -77,6 +85,10 @@ document.getElementById("create-form").addEventListener("submit", async ev => {
   const fd = new FormData(ev.target);
   if (!fd.get("must_change")) fd.set("must_change", "");
   const r = await adminPost("/admin/users/create", fd);
+  if (r.data && r.data.error === "reauth_required") {
+    showMsg(document.getElementById("msg"),
+            "Требуется повторный ввод пароля (step-up). Перенаправление…", "info");
+    location.href = r.data.reauth_url || "/admin/reauth?next=/admin/users"; return; }
   if (r.status >= 300 && r.status < 400) { location.href = "/admin/reauth?next=/admin/users"; return; }
   showMsg(document.getElementById("msg"), r.data.message || r.data.error,
           r.data.ok ? "ok" : "err");

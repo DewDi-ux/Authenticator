@@ -36,6 +36,10 @@ fetch("/admin/policy.json", {headers:{"Accept":"application/json"}})
 document.getElementById("policy-form").addEventListener("submit", async ev => {
   ev.preventDefault();
   const r = await adminPost("/admin/policy", new FormData(ev.target));
+  if (r.data && r.data.error === "reauth_required") {
+    showMsg(document.getElementById("msg"),
+            "Требуется повторный ввод пароля (step-up). Перенаправление…", "info");
+    location.href = r.data.reauth_url || "/admin/reauth?next=/admin/policy"; return; }
   if (r.status >= 300 && r.status < 400) {
     location.href = "/admin/reauth?next=/admin/policy"; return; }
   showMsg(document.getElementById("msg"),

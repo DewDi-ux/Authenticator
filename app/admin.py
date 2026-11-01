@@ -104,21 +104,48 @@ def _gate(request: Request) -> tuple[dict | None, store.User | None,
     return s, u, None
 
 
+def _wants_json(request: Request) -> bool:
+    """AJAX-запрос (fetch из консоли) vs обычная HTML-форма браузера."""
+    accept = request.headers.get("accept", "")
+    return "application/json" in accept
+
+
+def _reauth_denied(request: Request, next_url: str = "/admin",
+                   login_url: str = "/admin/login") -> Response:
+    """Отказ по step-up: для AJAX — JSON 401 reauth_required (иначе fetch
+    молча следует редиректу на HTML-страницу reauth и падает на разборе
+    HTML как JSON — «bad_response»); для форм — обычный 303."""
+    if _wants_json(request):
+        return JSONResponse(
+            {"ok": False, "error": "reauth_required",
+             "message": "Требуется повторное подтверждение (step-up).",
+             "reauth_url": f"/admin/reauth?next={next_url}"},
+            status_code=401)
+    return RedirectResponse(login_url, status_code=303)
+
+
 def _require_stepup(request: Request) -> tuple[dict | None, store.User | None,
                                                Response | None]:
-    """Для критических действий: stage=='step_up' + свежий timestamp."""
+    """Для критических действий: stage=='step_up' + свежий timestamp.
+
+    URL действия используется как next для страницы reauth — после повторного
+    ввода пароля админ возвращается туда, где выполнял действие.
+    """
     s, u = _current(request)
+    next_url = request.url.path or "/admin"
+    if not next_url.startswith("/admin"):
+        next_url = "/admin"
     if u is None or not u.is_admin or u.disabled:
-        return s, u, RedirectResponse("/admin/login", status_code=303)
+        return s, u, _reauth_denied(request, next_url)
     if s["stage"] != "step_up":
-        return s, u, RedirectResponse("/admin/reauth", status_code=303)
+        return s, u, _reauth_denied(request, next_url)
     st = _stepup_state(s["token"])
     if st is None or time.time() - st.get("granted_at", 0) > ADMIN_STEPUP_TTL:
         # не убиваем сессию целиком (иначе админ терял бы и authed-доступ):
         # просто снимаем grant и возвращаем в authed до повторного reauth
         _stepup_grants.pop(s["token"], None)
         store.set_session_stage(s["token"], "authed", ttl=ADMIN_SESSION_TTL)
-        return s, u, RedirectResponse("/admin/reauth", status_code=303)
+        return s, u, _reauth_denied(request, next_url)
     return s, u, None
 
 
