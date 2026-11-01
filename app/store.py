@@ -44,7 +44,10 @@ def init_db() -> None:
                 mfa_enabled INTEGER DEFAULT 0,
                 failed_attempts INTEGER DEFAULT 0,
                 locked_until REAL DEFAULT 0,   -- lockout до timestamp
-                created_at REAL
+                created_at REAL,
+                email TEXT,
+                role TEXT NOT NULL DEFAULT 'user',   -- user | admin
+                disabled INTEGER NOT NULL DEFAULT 0  -- мягкая деактивация
             );
             CREATE TABLE IF NOT EXISTS sessions(
                 token TEXT PRIMARY KEY,
@@ -76,6 +79,13 @@ def init_db() -> None:
         ucols = {r["name"] for r in c.execute("PRAGMA table_info(users)")}
         if "email" not in ucols:
             c.execute("ALTER TABLE users ADD COLUMN email TEXT")
+        # мягкая миграция: роли и деактивация учётных записей (админ-модуль)
+        if "role" not in ucols:
+            c.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL"
+                      " DEFAULT 'user'")
+        if "disabled" not in ucols:
+            c.execute("ALTER TABLE users ADD COLUMN disabled INTEGER"
+                      " NOT NULL DEFAULT 0")
 
 
 # ---------------------------------------------------------------------------
@@ -91,21 +101,30 @@ class User:
     failed_attempts: int
     locked_until: float
     email: str = ""
+    role: str = "user"        # user | admin
+    disabled: bool = False    # мягкая деактивация (увольнение)
 
     @staticmethod
     def from_row(r: sqlite3.Row) -> "User":
+        keys = r.keys()
         return User(
             id=r["id"], login=r["login"], full_name=r["full_name"] or "",
             pass_hash=r["pass_hash"], totp_enc=r["totp_enc"],
             recovery_hashes=json.loads(r["recovery_hashes"] or "[]"),
             mfa_enabled=bool(r["mfa_enabled"]),
             failed_attempts=r["failed_attempts"], locked_until=r["locked_until"],
-            email=(r["email"] if "email" in r.keys() else "") or "",
+            email=(r["email"] if "email" in keys else "") or "",
+            role=(r["role"] if "role" in keys else "user") or "user",
+            disabled=bool(r["disabled"]) if "disabled" in keys else False,
         )
+
+    @property
+    def is_admin(self) -> bool:
+        return self.role == "admin"
 
 
 def create_user(login: str, password: str, full_name: str = "",
-                email: str = "") -> User:
+                email: str = "", role: str = "user") -> User:
     errors = security.check_password_policy(password, login)
     if errors:
         raise ValueError("; ".join(errors))
@@ -116,11 +135,12 @@ def create_user(login: str, password: str, full_name: str = "",
         if cur.fetchone():
             raise ValueError("Логин уже занят.")
         c.execute(
-            "INSERT INTO users VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO users VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (uid, login, full_name, security.hash_password(password),
-             None, None, 0, 0, 0.0, now, email.strip().lower()),
+             None, None, 0, 0, 0.0, now, email.strip().lower(),
+             role, 0),
         )
-    audit("user.created", actor=login)
+    audit("user.created", actor=login, details={"role": role})
     return get_user_by_login(login)  # type: ignore[return-value]
 
 
@@ -150,11 +170,63 @@ def update_user(u: User) -> None:
     with _lock, _conn() as c:
         c.execute(
             "UPDATE users SET pass_hash=?, totp_enc=?, recovery_hashes=?,"
-            " mfa_enabled=?, failed_attempts=?, locked_until=?, email=? WHERE id=?",
+            " mfa_enabled=?, failed_attempts=?, locked_until=?, email=?,"
+            " role=?, disabled=? WHERE id=?",
             (u.pass_hash, u.totp_enc, json.dumps(u.recovery_hashes),
              int(u.mfa_enabled), u.failed_attempts, u.locked_until,
-             (u.email or "").strip().lower(), u.id),
+             (u.email or "").strip().lower(), u.role, int(u.disabled), u.id),
         )
+
+
+# ---------------------------------------------------------------------------
+# Запросы для админ-модуля (только через /admin/*, см. app/admin.py)
+# ---------------------------------------------------------------------------
+def list_users() -> list[User]:
+    """Список всех учётных записей (без полей секретов в вызывающем коде)."""
+    with _conn() as c:
+        rows = c.execute("SELECT * FROM users ORDER BY created_at").fetchall()
+    return [User.from_row(r) for r in rows]
+
+
+def admin_count() -> int:
+    """Число активных администраторов — защита от «последнего админа»."""
+    with _conn() as c:
+        r = c.execute("SELECT COUNT(*) AS n FROM users"
+                      " WHERE role='admin' AND disabled=0").fetchone()
+    return int(r["n"])
+
+
+def audit_query(event_prefix: str | None = None, actor: str | None = None,
+                only_failed: bool = False, limit: int = 100) -> list[dict]:
+    """Фильтрованная выборка из журнала аудита (параметрический SQL)."""
+    sql, args = ["SELECT * FROM audit_log"], []
+    conds = []
+    if event_prefix:
+        conds.append("event LIKE ?"); args.append(event_prefix + "%")
+    if actor:
+        conds.append("actor = ?"); args.append(actor)
+    if only_failed:
+        conds.append("success = 0")
+    if conds:
+        sql.append("WHERE " + " AND ".join(conds))
+    sql.append("ORDER BY id DESC LIMIT ?"); args.append(max(1, min(limit, 500)))
+    with _conn() as c:
+        rows = c.execute(" ".join(sql), tuple(args)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def user_sessions(user_id: str | None = None) -> list[dict]:
+    """Активные (не истёкшие) сессии — все или для одного пользователя."""
+    now = time.time()
+    q = ("SELECT s.*, u.login FROM sessions s JOIN users u ON u.id=s.user_id"
+         " WHERE s.expires_at > ?")
+    args: list = [now]
+    if user_id:
+        q += " AND s.user_id = ?"; args.append(user_id)
+    q += " ORDER BY s.created_at DESC"
+    with _conn() as c:
+        rows = c.execute(q, tuple(args)).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
