@@ -72,9 +72,9 @@ async function act(url, data, btn) {
   if (r.data.ok) setTimeout(() => location.reload(), 900);
 }
 async function disableUser(id, login) {
-  const c = prompt(`Для деактивации «${login}» введите логин ещё раз:`);
-  if (c === null) return;
-  const r = await adminPost(`/admin/users/${id}/disable`, {confirm: c});
+  // Дополнительный ввод логина убран: подтверждением служит step-up
+  if (!confirm(`Деактивировать «${login}»? Будут сброшены все её активные сессии.`)) return;
+  const r = await adminPost(`/admin/users/${id}/disable`, new URLSearchParams());
   if (r.data && r.data.error === "reauth_required") {
     showMsg(document.getElementById("msg"),
             "Требуется повторный ввод пароля (step-up). Перенаправление…", "info");

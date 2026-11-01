@@ -79,9 +79,9 @@ async function act(action, data, okText) {
   if (r.data.ok && action !== "reset-factor") setTimeout(() => location.reload(), 900);
 }
 async function disableUser() {
-  const c = prompt("Для деактивации введите логин «{{ t.login }}»:");
-  if (c === null) return;
-  act("disable", {confirm: c}, "Деактивировано");
+  // Дополнительный ввод логина убран: подтверждением служит step-up
+  if (!confirm("Деактивировать учётку «{{ t.login }}»? Будут сброшены все её активные сессии.")) return;
+  act("disable", {}, "Деактивировано");
 }
 async function resetFactor() {
   const reason = prompt("Основание сброса фактора (акт инцидента ИБ):") || "";

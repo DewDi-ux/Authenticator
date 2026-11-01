@@ -556,7 +556,7 @@ async def unlock_user(request: Request, uid: str):
 
 
 @router.post("/users/{uid}/disable")
-async def disable_user(request: Request, uid: str, confirm: str = Form("")):
+async def disable_user(request: Request, uid: str):
     s, u, deny = _require_stepup(request)
     if deny:
         return deny
@@ -565,9 +565,9 @@ async def disable_user(request: Request, uid: str, confirm: str = Form("")):
         return JSONResponse({"error": "not_found"}, 404)
     if t.id == u.id:
         return JSONResponse({"error": "self_disable_forbidden"}, 400)
-    if confirm != t.login:
-        return JSONResponse({"error": "confirm_mismatch",
-                             "message": "Введите логин учётки для подтверждения."}, 400)
+    # Дополнительное окно «введите логин» убрано: подтверждением служит
+    # step-up (повторный ввод пароля администратора), дублировать его
+    # ручным вводом логина не требуется.
     if t.is_admin and store.admin_count() <= 1:
         return JSONResponse({"error": "last_admin"}, 400)
     t.disabled = True

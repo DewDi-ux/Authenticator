@@ -297,6 +297,17 @@ async def login(request: Request, background_tasks: BackgroundTasks,
         await _dummy_hash(password)
         return _login_error(request)
 
+    # Мягкая деактивация (увольнение, блокировка администратором): вход
+    # запрещён независимо от корректности пароля. Проверка ДО верификации
+    # пароля — деактивированная учётка не должна порождать ни промежуточных
+    # сессий, ни стадий mfa/step_up/setup.
+    if u.disabled:
+        store.audit("auth.fail.disabled", actor=u.login, ip=ip, success=False)
+        return templates.TemplateResponse(
+            request, "login.html",
+            {"msg": "Учётная запись деактивирована. Обратитесь к администратору."},
+            status_code=403)
+
     if risk.is_locked(u):
         store.audit("auth.fail.locked", actor=u.login, ip=ip, success=False)
         return templates.TemplateResponse(
@@ -779,6 +790,11 @@ async def api_auth_login(request: Request, background_tasks: BackgroundTasks):
         await _dummy_hash(password)
         store.audit("integration.auth.fail", actor=login, ip=ip, success=False)
         return JSONResponse({"error": "invalid_credentials"}, 401)
+    # Деактивированная учётка: вход через интеграционный контур ИС также
+    # запрещён (та же политика, что и в браузерном /login).
+    if u.disabled:
+        store.audit("integration.auth.disabled", actor=u.login, ip=ip, success=False)
+        return JSONResponse({"error": "account_disabled"}, 403)
     if risk.is_locked(u):
         store.audit("integration.auth.locked", actor=u.login, ip=ip, success=False)
         return JSONResponse({"error": "account_locked"}, 403)
