@@ -33,8 +33,52 @@ def outside_work_hours(now: float | None = None) -> bool:
     return not (WORK_HOURS[0] <= hour < WORK_HOURS[1])
 
 
+# ---------------------------------------------------------------------------
+# Дополнительные эвристики риска (пассивные, без изменения API score_login)
+# ---------------------------------------------------------------------------
+def is_proxy_or_tor(ip: str) -> bool:
+    """Публичные Tor-exit-ноды (список обновляется по мере возможности —
+    в проде лучше выносить в GeoIP/VPN-детектор сервис)."""
+    _TOR_EXITS = ("185.220.", "162.247.74.", "171.25.193.", "104.244.76.")
+    return ip.startswith(_TOR_EXITS)
+
+
+def is_new_browser(ua: str | None) -> bool:
+    """UA пустой или выглядит как автономный клиент/headless браузер — частый признак ботов."""
+    if not ua:
+        return True
+    low = ua.lower()
+    return any(k in low for k in ("headless", "phantomjs", "curl/", "wget/", "python-requests"))
+
+
+def impossible_travel(prev_ip: str | None, prev_ts: float | None,
+                      cur_ip: str, cur_ts: float | None = None,
+                      min_km_per_hour: float = 800.0) -> bool:
+    """Проверка на «невозможное перемещение»: два разных внешних IP за короткое время.
+    
+    Возвращает True, если между двумя входами с разных подсетей прошло слишком мало времени для физического перемещения.
+    Для упрощения считаем, что разные /24 сети соответствуют разным городам (~1000 км), при минимальной скорости 800 км/ч это ~1.25 часа.
+    """
+    if not prev_ip or not prev_ts:
+        return False
+    # Если оба IP внутри доверенной сети — не считаем travel risk
+    if _in_trusted_network(prev_ip) and _in_trusted_network(cur_ip):
+        return False
+    # Разные ли /24 подсети? (упрощённо: сравниваем первые три октета IPv4)
+    def prefix24(ip: str) -> str:
+        parts = ip.split(".")
+        return ".".join(parts[:3]) if len(parts) == 4 else ip
+    if prefix24(prev_ip) == prefix24(cur_ip):
+        return False
+    # Прошло ли меньше MIN_HOURS_FOR_TRAVEL часов?
+    cur_ts = cur_ts or time.time()
+    hours_elapsed = (cur_ts - prev_ts) / 3600.0
+    return hours_elapsed < (1000.0 / min_km_per_hour)
+
+
 def score_login(ip: str, ua: str, known_ua: str | None, failed_recent: int,
-                minutes_since_last: float | None = None) -> tuple[int, list[str]]:
+                minutes_since_last: float | None = None,
+                prev_ip: str | None = None, prev_ts: float | None = None) -> tuple[int, list[str]]:
     """Возвращает (score, причины). Каждая причина — строка для журнала.
 
     Калибровка весов (см. docs/integration.md, раздел «Модель угроз и риск»):
@@ -43,6 +87,13 @@ def score_login(ip: str, ua: str, known_ua: str | None, failed_recent: int,
     сочетании двух и более независимых признаков риска либо при явном
     признаке перебора учётных данных. Это исключает ситуацию, когда
     «рискованный» вердикт выдаётся каждому пользователю на стенде.
+
+    Дополнительные эвристики (опциональные аргументы — обратная совместимость):
+      * proxy/Tor-IP;
+      * headless/бот UA;
+      * impossible travel (разные /24 за короткое время);
+      * weekend login;
+      * too many recent logins (>5 within 1h).
     """
     score, reasons = 0, []
 
@@ -73,7 +124,63 @@ def score_login(ip: str, ua: str, known_ua: str | None, failed_recent: int,
         score += 8
         reasons.append("dormant account reactivation (>30 days)")
 
+    # --- новые эвристики ---
+    if is_proxy_or_tor(ip):
+        score += 20
+        reasons.append("proxy/tor IP detected")
+
+    if is_new_browser(ua):
+        score += 12
+        reasons.append("bot/headless user-agent")
+
+    if impossible_travel(prev_ip, prev_ts, ip):
+        score += 25
+        reasons.append("impossible travel between logins")
+
+    # weekend login (суббота=5, воскресенье=6 в Python localtime)
+    wd = time.localtime().tm_wday
+    if wd in (5, 6):
+        score += 6
+        reasons.append("weekend login")
+
+    # too many recent logins (проверяем через глобальный счётчик)
+    # NB: учитываем частоту входов конкретного IP, а не общий счётчик всех
+    # запросов score_login — иначе фоновые тестовые/админские входы с других
+    # адресов ложно завышают риск обычным пользователям.
+    now = time.time()
+    _recent_logins[:] = [(t, i) for t, i in _recent_logins if now - t < 3600]
+    same_ip_hits = [t for t, i in _recent_logins if i == ip]
+    _recent_logins.append((now, ip))
+    if len(same_ip_hits) + 1 > 5:
+        score += 10
+        reasons.append("too many recent logins (>5/hour)")
+
     return min(score, 100), reasons
+
+
+# Глобальный список для отслеживания частоты входов: (ts, ip).
+# В проде лучше Redis/скользящее окно по ключу ip/user_id.
+_recent_logins: list[tuple[float, str]] = []
+
+
+def _last_login_ip(user_id: str, before_ts: float | None = None) -> tuple[str | None, float | None]:
+    """Возвращает (ip, ts) последнего успешного входа пользователя до before_ts.
+    
+    Используется для impossible travel проверки. Берём из audit_log события auth.success*.
+    """
+    from . import store  # ленивый импорт для избежания circular dependency
+    with store._conn() as c:
+        q = ("SELECT ip, ts FROM audit_log WHERE actor=("
+             "SELECT login FROM users WHERE id=?) AND ("
+             "event='auth.success' OR event='auth.success_recovery' OR "
+             "event LIKE 'integration.auth.success%')")
+        args = [user_id]
+        if before_ts is not None:
+            q += " AND ts < ?"
+            args.append(before_ts)
+        q += " ORDER BY id DESC LIMIT 1"
+        r = c.execute(q, tuple(args)).fetchone()
+    return (r["ip"], r["ts"]) if r else (None, None)
 
 
 def decision(score: int) -> str:
