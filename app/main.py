@@ -338,8 +338,10 @@ async def login(request: Request, background_tasks: BackgroundTasks,
     # решение. Теперь риск считается по накопленному счётчику.
     last_login_ts = _last_success_ts(u.id)
     minutes_since = (time.time() - last_login_ts) / 60 if last_login_ts else None
+    prev_ip, prev_ts = risk._last_login_ip(u.id, before_ts=time.time())
     score, reasons = risk.score_login(ip, agent, _known_ua(u.id),
-                                      u.failed_attempts, minutes_since)
+                                      u.failed_attempts, minutes_since,
+                                      prev_ip=prev_ip, prev_ts=prev_ts)
     verdict = risk.decision(score)
     store.audit("auth.risk_score", actor=u.login, ip=ip,
                 details={"score": score, "reasons": reasons, "decision": verdict,
@@ -816,8 +818,10 @@ async def api_auth_login(request: Request, background_tasks: BackgroundTasks):
 
     last_login_ts = _last_success_ts(u.id)
     minutes_since = (time.time() - last_login_ts) / 60 if last_login_ts else None
+    prev_ip, prev_ts = risk._last_login_ip(u.id, before_ts=time.time())
     score, reasons = risk.score_login(ip, agent, _known_ua(u.id),
-                                      u.failed_attempts, minutes_since)
+                                      u.failed_attempts, minutes_since,
+                                      prev_ip=prev_ip, prev_ts=prev_ts)
     verdict = risk.decision(score)
     need_step_up = (risk.require_step_up(verdict, score, reasons)
                     and u.mfa_enabled and bool(u.recovery_hashes))
